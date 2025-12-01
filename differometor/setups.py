@@ -488,11 +488,13 @@ def uifo(
             S.space(f"center{x}{y}", f"{mirrors[i]}{x}{y}", length=1, source_port=port)    
 
         if mode == "space_modulation":
-            # phase 180 for signals on vertical spaces
-            S.add("signal", f"scenter{x}{y}ml{x}{y}", target=f"center{x}{y}_ml{x}{y}", phase = 180 if left_port_position in ["top", "bottom"] else 0)
-            S.add("signal", f"scenter{x}{y}mr{x}{y}", target=f"center{x}{y}_mr{x}{y}", phase = 180 if left_port_position in ["top", "bottom"] else 0)
-            S.add("signal", f"scenter{x}{y}mt{x}{y}", target=f"center{x}{y}_mt{x}{y}", phase = 180 if left_port_position in ["left", "right"] else 0)
-            S.add("signal", f"scenter{x}{y}mb{x}{y}", target=f"center{x}{y}_mb{x}{y}", phase = 180 if left_port_position in ["left", "right"] else 0)
+            # 0 phase for horizontal space, 180 for vertical spaces. 
+            # Signal phase is based purely on geometry (physical direction of space):
+            # This is independent of beamsplitter port orientation.
+            S.add("signal", f"scenter{x}{y}ml{x}{y}", target=f"center{x}{y}_ml{x}{y}", phase=0)
+            S.add("signal", f"scenter{x}{y}mr{x}{y}", target=f"center{x}{y}_mr{x}{y}", phase=0)
+            S.add("signal", f"scenter{x}{y}mt{x}{y}", target=f"center{x}{y}_mt{x}{y}", phase=180)
+            S.add("signal", f"scenter{x}{y}mb{x}{y}", target=f"center{x}{y}_mb{x}{y}", phase=180)
 
     def boundary_cell(S: Setup, x: int, y: int, boundary: str = "laser", mass: bool = True, position: str = "left"):
         S.add("mirror", f"m{x}{y}")
