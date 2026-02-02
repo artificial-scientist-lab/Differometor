@@ -419,7 +419,7 @@ You can connect components via spaces:
 
 ## Development
 
-Differometor is developed at the [Artificial Scientist Lab](https://mpl.mpg.de/research-at-mpl/independent-research-groups/krenn-research-group/) under Dr. Mario Krenn at the Max Planck Institute for the Science of Light in Erlangen, Germany.
+Differometor is developed at the [Artificial Scientist Lab](https://uni-tuebingen.de/en/research/core-research/cluster-of-excellence-machine-learning/research/research/cluster-research-groups/professorships/machine-learning-in-science-ii/) under Dr. Mario Krenn at the University of Tübingen, Germany.
 
 
 ## Citing Differometor
