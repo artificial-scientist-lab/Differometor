@@ -1,10 +1,18 @@
 import json
+import numpy as np
 import differometor as df
 import jax.numpy as jnp
 import matplotlib.pyplot as plt
 from differometor.setups import Setup
 from differometor.setups import voyager
 from differometor.components import demodulate_signal_power
+
+
+UIFO_TYPE = "800_3000" # options: "20_5000", "800_3000"
+
+if UIFO_TYPE == "800_3000":
+    with open(f"examples/data/uifo_{UIFO_TYPE}_test_data.json", "r") as f:
+        uifo_test_data = json.load(f)
 
 
 ### Calculate the Voyager sensitivity ###
@@ -16,7 +24,7 @@ print("Calculating Voyager sensitivity...")
 S, _ = voyager()
 
 # set the frequency range
-frequencies = jnp.logspace(jnp.log10(800), jnp.log10(3000), 100)
+frequencies = jnp.array(uifo_test_data["frequencies"]) if UIFO_TYPE == "800_3000" else jnp.logspace(jnp.log10(float(UIFO_TYPE.split("_")[0])), jnp.log10(float(UIFO_TYPE.split("_")[1])), 100)
 
 # run the simulation with the frequency as the changing parameter
 carrier, signal, noise, detector_ports, *_ = df.run(S, [("f", "frequency")], frequencies)
@@ -40,7 +48,7 @@ print("Voyager sensitivity calculation done!")
 print("Calculating pre-trained UIFO sensitivity...")
 
 # Load the pre-trained UIFO model (no balanced homodyne detection, so only one detector)
-with open("examples/data/uifo_800_3000.json", "r") as f:
+with open(f"examples/data/uifo_{UIFO_TYPE}.json", "r") as f:
     uifo = json.load(f)    
 
 S = Setup.from_data(uifo)
@@ -61,6 +69,9 @@ else:
 # calculate the sensitivity
 uifo_sensitivity = noise / jnp.abs(powers)
 
+if UIFO_TYPE == "800_3000":
+    np.testing.assert_allclose(np.log(uifo_sensitivity), np.log(uifo_test_data["sensitivities"]), atol=1e-5, rtol=0)
+
 print("Pre-trained UIFO sensitivity calculation done!")
 
 
@@ -74,4 +85,4 @@ plt.ylabel("Sensitivity [/sqrt(Hz)]")
 plt.legend()
 plt.grid()
 plt.tight_layout()
-plt.savefig("output_uifo.png")
+plt.savefig("examples/results/uifo.png")

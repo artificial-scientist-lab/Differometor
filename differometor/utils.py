@@ -1,297 +1,373 @@
-import os
-import numpy as np
+"""
+Utilities for parameter bounding, setup mutation, simulation evaluation, and sensitivity/loss analysis.
+
+This module contains:
+- Bounding functions that map unconstrained parameters into physical bounds.
+- Helper functions to write values into a simulation setup (node or edge properties).
+- Power extraction utilities for detectors and optical components.
+- Sensitivity calculators for different noise models.
+
+Notes
+-----
+- The code uses JAX arrays (`jax.numpy` as `jnp`) and is written to be compatible with JAX tracing
+  in most places. Be careful when converting JAX values to Python floats inside code paths that
+  are intended to be JIT-compiled.
+- Several functions assume a specific port ordering and packing for components, as described in
+  the `calculate_powers` docstring.
+"""
+
 import jax.numpy as jnp
-from differometor.plot import plot_powers, plot_comparison
-from differometor.simulate import run_setups, run_setups_with_parameter_sets
+
+from typing import Any, Callable, List, Sequence, Tuple, Union
+
 from differometor.components import power_detector, demodulate_signal_power
 
 
-def default_bounding(
-        parameters, 
-        bounds
-    ):
-    return parameters * (bounds[1] - bounds[0]) + bounds[0]
+def sigmoid_bounding(parameters: jnp.ndarray, bounds: jnp.ndarray) -> jnp.ndarray:
+    """
+    Map unconstrained parameters to physical bounds using a logistic sigmoid transform.
 
+    The mapping is:
+        u = sigmoid(p) = 1 / (1 + exp(-p))   -> u in (0, 1)
+        x = u * (upper - lower) + lower
 
-def clip_bounding(
-        parameters, 
-        bounds
-    ):
-    epsilon = 1e-10
-    clipped_parameters = jnp.clip(parameters, 0.0 + epsilon, 1.0 - epsilon)
-    return clipped_parameters * (bounds[1] - bounds[0]) + bounds[0]
+    Parameters
+    ----------
+    parameters
+        Unconstrained real-valued parameters.
+    bounds
+        Bounds array with shape (2, ...). See `default_bounding`.
 
-
-def tanh_bounding(
-        parameters, 
-        bounds
-    ):
-    tanh_parameters = 0.5 * (jnp.tanh(parameters) + 1.0)
-    return tanh_parameters * (bounds[1] - bounds[0]) + bounds[0]
-
-
-def sigmoid_bounding(
-        parameters, 
-        bounds
-    ):
+    Returns
+    -------
+    jnp.ndarray
+        Parameters mapped into the provided bounds.
+    """
     sigmoid_parameters = 1 / (1 + jnp.exp(-parameters))
     return sigmoid_parameters * (bounds[1] - bounds[0]) + bounds[0]
 
 
+def inverse_sigmoid_bounding(parameters: jnp.ndarray, bounds: jnp.ndarray) -> jnp.ndarray:
+    """
+    Map parameters in physical bounds back to unconstrained space using the inverse sigmoid.
+
+    This is the inverse of `sigmoid_bounding`. It maps parameters from [lower, upper]
+    back to the real line.
+
+    The mapping is:
+        u = (x - lower) / (upper - lower)   -> u in (0, 1)
+        p = log(u / (1 - u))
+
+    Parameters
+    ----------
+    parameters
+        Parameters in physical bounds.
+    bounds
+        Bounds array with shape (2, ...). See `default_bounding`.
+        
+    Returns
+    -------
+    jnp.ndarray
+        Unconstrained parameters mapped from the provided bounds.
+    """
+    u = (parameters - bounds[0]) / (bounds[1] - bounds[0])
+    return jnp.log(u / (1 - u))
+
+
 def set_value(
-        node, 
-        property_name, 
-        value, 
-        setup
-    ):
-    if not '_' in node:
+    node: str,
+    property_name: str,
+    value: Any,
+    setup: Any,
+) -> None:
+    """
+    Set a property value on a setup node or edge.
+
+    The setup is expected to expose:
+    - `setup.nodes[name]` for node data
+    - `setup.edges["source_target"]` for edge data
+
+    Edge names are inferred by the convention that an underscore indicates an edge key in the
+    form "source_target". If the provided name has no underscore, it is treated as a node.
+
+    Parameters
+    ----------
+    node
+        Node name (for example "m1") or edge identifier string "source_target".
+    property_name
+        Name of the property to set inside the component "properties" mapping.
+    value
+        Value to store for the property.
+    setup
+        The setup object that holds nodes and edges with mutable property dictionaries.
+
+    Returns
+    -------
+    None
+        This function mutates `setup` in place.
+    """
+    # Node name: no underscore present.
+    if "_" not in node:
         try:
             setup.nodes[node]["properties"][property_name] = value
         except KeyError:
             setup.nodes[node]["properties"] = {property_name: value}
-    else:
-        source, target = node.split('_')
-        try:
-            setup.edges[source + '_' + target]["properties"][property_name] = value
-        except KeyError:
-            setup.edges[source + '_' + target]["properties"] = {property_name: value}
+        return
+
+    # Edge name: underscore present, interpreted as "source_target".
+    source, target = node.split("_")
+    edge_key = source + "_" + target
+    try:
+        setup.edges[edge_key]["properties"][property_name] = value
+    except KeyError:
+        setup.edges[edge_key]["properties"] = {property_name: value}
 
 
 def calculate_powers(
-        carrier_solution,
-        detector_indices,
-        mirror_indices,
-        beamsplitter_indices,
-        isolator_indices
-    ):
+    carrier_solution: jnp.ndarray,
+    detector_indices: jnp.ndarray,
+    mirror_indices: jnp.ndarray,
+    beamsplitter_indices: jnp.ndarray,
+    isolator_indices: jnp.ndarray,
+) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
     """
-    Calculates the powers at all detectors, mirrors, beamsplitters and isolators defined by the provided indices.
+    Calculate powers at detectors and selected components and summarize by "hard" and "soft" sides.
+
+    This function extracts port powers from a carrier solution and then aggregates component powers
+    by selecting the maximum power per "side". The concept of "hard side" and "soft side" is:
+
+    - Hard side: the side (per component) that contains the larger maximum port power.
+    - Soft side: the opposite side's maximum port power.
+    - Isolators are appended to the soft-side list directly (no side comparison is performed).
+
+    Port packing assumptions
+    ------------------------
+    - Beamsplitter ports are packed in groups of 8 ports:
+        left in, left out, top in, top out, right in, right out, bottom in, bottom out
+      The function treats:
+        - left+top as side A (ports 0..3)
+        - right+bottom as side B (ports 4..7)
+    - Mirror ports are packed in groups of 4 ports:
+        left in, left out, right in, right out
+      The function treats:
+        - left as side A (ports 0..1)
+        - right as side B (ports 2..3)
 
     Parameters
     ----------
-    carrier_solution: jnp.ndarray 
-        The solution of the carrier system.
-    detector_indices: jnp.ndarray
-        The indices of all detectors within the setup.
-    mirror_indices: jnp.ndarray
-        The indices of all mirrors within the setup.
-    beamsplitter_indices: jnp.ndarray
-        The indices of all beamsplitters within the setup.
-    isolator_indices: jnp.ndarray
-        The indices of all isolators within the setup.
+    carrier_solution
+        Carrier field solution for the setup, as produced by the simulator.
+    detector_indices
+        Indices of detector ports in the flattened power array.
+    mirror_indices
+        Indices of mirror ports in the flattened power array.
+    beamsplitter_indices
+        Indices of beamsplitter ports in the flattened power array.
+    isolator_indices
+        Indices of isolator ports in the flattened power array.
 
     Returns
     -------
-    hard_side_powers: jnp.ndarray
-        The maximal powers at the component sides of maximal power
-    soft_side_powers: jnp.ndarray
-        The maximal powers at the component sides of minimal power
-    detector_powers: jnp.ndarray
-        The powers at the detector ports
+    hard_side_powers
+        Concatenated maximum powers on the dominant sides of beamsplitters and mirrors.
+        Shape depends on the number of components and the power array trailing dimensions.
+    soft_side_powers
+        Concatenated maximum powers on the opposite sides of beamsplitters and mirrors,
+        followed by isolator powers.
+    detector_powers
+        Powers at detector ports.
     """
-    # beamsplitter left in out, top in out, right in out, bottom in out
-    # mirror left in out, right in out
-    # 1 beamsplitter, 6 mirrors => 1 * 8 + 6 * 4 = 32 ports
     carrier_powers = power_detector(carrier_solution)
+
     beamsplitter_powers = carrier_powers[beamsplitter_indices]
     mirror_powers = carrier_powers[mirror_indices]
     isolator_powers = carrier_powers[isolator_indices]
 
-    beamsplitters = beamsplitter_powers.reshape(-1, 8, *beamsplitter_powers.shape[1:])  # Reshape beamsplitters (x pack of 8 ports)
-    # For the beam splitter: Identify the port with maximum power on each side
-    # Sides: left+top (ports 0-3), right+bottom (ports 4-7)
+    # Reshape into groups of ports per component.
+    beamsplitters = beamsplitter_powers.reshape(-1, 8, *beamsplitter_powers.shape[1:])
+
     beamsplitter_left_top = beamsplitters[:, :4]
     beamsplitter_right_bottom = beamsplitters[:, 4:]
 
-    # Maximum power and port index for each side
     max_power_left_top = jnp.max(beamsplitter_left_top, axis=1)
     max_power_right_bottom = jnp.max(beamsplitter_right_bottom, axis=1)
 
-    # Identify the overall maximum power and its opposite side power
-    if_beamsplitter = max_power_left_top > max_power_right_bottom
-    max_beamsplitter_power = jnp.where(if_beamsplitter, max_power_left_top, max_power_right_bottom)
-    opposite_beamsplitter_power = jnp.where(if_beamsplitter, max_power_right_bottom, max_power_left_top)
+    # Select dominant side per beamsplitter, and capture the opposite side maximum as well.
+    is_left_top_dominant = max_power_left_top > max_power_right_bottom
+    max_beamsplitter_power = jnp.where(is_left_top_dominant, max_power_left_top, max_power_right_bottom)
+    opposite_beamsplitter_power = jnp.where(is_left_top_dominant, max_power_right_bottom, max_power_left_top)
 
-    mirrors = mirror_powers.reshape(-1, 4, *mirror_powers.shape[1:])  # Reshape mirrors (y packs of 4 ports)
-    # For mirrors: Compare individual ports
-    # Sides: left (ports 0-1 for each pack), right (ports 2-3 for each pack)
+    mirrors = mirror_powers.reshape(-1, 4, *mirror_powers.shape[1:])
     mirrors_left = mirrors[:, :2]
     mirrors_right = mirrors[:, 2:]
 
-    # Maximum power on each side for all packs
     max_power_left = jnp.max(mirrors_left, axis=1)
     max_power_right = jnp.max(mirrors_right, axis=1)
 
-    # Identify the maximum power across sides and the opposite side's maximum
-    if_mirrors = max_power_left > max_power_right
-    max_mirrors_power = jnp.where(if_mirrors, max_power_left, max_power_right)
-    opposite_mirrors_power = jnp.where(if_mirrors, max_power_right, max_power_left)
+    is_left_dominant = max_power_left > max_power_right
+    max_mirrors_power = jnp.where(is_left_dominant, max_power_left, max_power_right)
+    opposite_mirrors_power = jnp.where(is_left_dominant, max_power_right, max_power_left)
 
-    # Combine results into the required arrays
-    hard_side_powers = jnp.concatenate([max_beamsplitter_power, max_mirrors_power], axis=0)    
-    soft_side_powers = jnp.concatenate([opposite_beamsplitter_power, opposite_mirrors_power, isolator_powers], axis=0)
+    hard_side_powers = jnp.concatenate([max_beamsplitter_power, max_mirrors_power], axis=0)
+    soft_side_powers = jnp.concatenate(
+        [opposite_beamsplitter_power, opposite_mirrors_power, isolator_powers], axis=0
+    )
     detector_powers = carrier_powers[detector_indices]
 
     return hard_side_powers, soft_side_powers, detector_powers
 
 
 def update_setup(
-        parameters, 
-        optimization_pairs, 
-        bounds, 
-        setup,
-        bounding_function=sigmoid_bounding
-    ):
-    for ix, optimization_pair in enumerate(optimization_pairs):
-        value = float(bounding_function(parameters[ix], bounds[:, ix]))
+    parameters: jnp.ndarray,
+    optimization_pairs: Sequence[Union[Tuple[str, str], List[Tuple[str, str]]]],
+    bounds: jnp.ndarray,
+    setup: Any,
+    bounding_function: Callable[[jnp.ndarray, jnp.ndarray], jnp.ndarray] = sigmoid_bounding,
+) -> None:
+    """
+    Apply a parameter vector to a setup by writing bounded values to specified properties.
+
+    Each entry in `optimization_pairs` specifies where to write the bounded value:
+    - If the entry is a tuple (component_name, property_name), one property is updated.
+    - If the entry is a list of tuples, the same bounded value is written to each listed target.
+
+    Parameters
+    ----------
+    parameters
+        One-dimensional array of raw optimization parameters. Length must match
+        `len(optimization_pairs)`.
+    optimization_pairs
+        A sequence where each element is either:
+        - (component_name, property_name), or
+        - [(component_name, property_name), ...] for applying the same value to multiple targets.
+    bounds
+        Bounds with shape (2, number_of_parameters). `bounds[:, index]` is used for the
+        corresponding parameter.
+    setup
+        The setup object to mutate in place.
+    bounding_function
+        Function that maps a raw parameter and its bounds to a physical value.
+
+    Returns
+    -------
+    None
+        This function mutates `setup` in place.
+    """
+    for index, optimization_pair in enumerate(optimization_pairs):
+        # Convert to a Python float for storage in the setup object.
+        value = float(bounding_function(parameters[index], bounds[:, index]))
+
         if isinstance(optimization_pair[0], list):
-            for component_name, property_name in optimization_pair:
+            # A list of (component_name, property_name) pairs.
+            for component_name, property_name in optimization_pair:  # type: ignore[misc]
                 set_value(component_name, property_name, value, setup)
         else:
-            component_name, property_name = optimization_pair
+            # A single (component_name, property_name) pair.
+            component_name, property_name = optimization_pair  # type: ignore[misc]
             set_value(component_name, property_name, value, setup)
 
 
 def calculate_sensitivities(
-        results,
-        sensitivity_function,
-        homodyne=True
-    ):
+    results: Sequence[Tuple[Any, Any, Any, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]],
+    sensitivity_function: Callable[[List[jnp.ndarray], List[jnp.ndarray], jnp.ndarray], jnp.ndarray],
+    frequencies: jnp.ndarray,
+    homodyne: bool = True,
+) -> jnp.ndarray:
     """
-    Calculates the sensitivities of the setup.
+    Compute setup sensitivities from simulation results.
+
+    Each element of `results` is expected to contain:
+        (carrier_solution, signal_solution, noise, detector_indices, mirror_indices,
+         beamsplitter_indices, isolator_indices)
+
+    Signal extraction:
+    - Signal powers are computed by demodulating the signal against the carrier solution.
+    - Only detector ports are used for the sensitivity calculation.
+    - For balanced homodyne detection, the signal is taken as the absolute difference between
+      the first two detectors (assumed to be the homodyne pair).
+    - For non-homodyne detection, the signal is taken from the first detector.
 
     Parameters
     ----------
-    results: list
-        A list of the following structure: [(carrier, signal, noise, detector_indices, mirror_indices, beamsplitter_indices, isolator_indices)]
-    sensitivity_function: callable
-        A function that calculates the sensitivity given the noise and power levels.
-    homodyne: bool
-        Whether the setup uses a balanced homodyne detection scheme or not.
+    results
+        Simulation results, one element per noise model or per setup variant as expected
+        by `sensitivity_function`.
+    sensitivity_function
+        Callable that returns sensitivity given:
+        - a list of noise arrays,
+        - a list of signal power arrays,
+        - and the frequencies array.
+    frequencies
+        Frequency grid used in the simulations. Shape is typically (number_of_ranges, number_of_points)
+        but depends on the rest of your pipeline.
+    homodyne
+        If True, treat the first two detector channels as a balanced homodyne pair.
 
     Returns
     -------
-    sensitivities: jnp.ndarray
-        The calculated sensitivities for the setup.
+    jnp.ndarray
+        Sensitivity array as returned by `sensitivity_function`.
     """
-    noises = []
-    powers = []
+    noises: List[jnp.ndarray] = []
+    powers: List[jnp.ndarray] = []
+
     for result in results:
-        signal_powers = demodulate_signal_power(result[0], result[1])
-        signal_powers = signal_powers[result[3]]
+        carrier_solution, signal_solution, noise, detector_indices = result[0], result[1], result[2], result[3]
+
+        # Demodulate using carrier and signal solutions.
+        signal_powers = demodulate_signal_power(carrier_solution, signal_solution)
+
+        # Extract signal powers at the detector ports.
+        signal_powers = signal_powers[detector_indices]
+
         if homodyne:
-            # assuming only two detectors
-            signal_powers = jnp.abs(signal_powers[0] - signal_powers[1]) 
+            # Balanced homodyne: assume two detectors.
+            signal_powers = jnp.abs(signal_powers[0] - signal_powers[1])
         else:
+            # Single-ended detection: use the first detector.
             signal_powers = jnp.abs(signal_powers[0])
+
         powers.append(signal_powers)
-        noises.append(result[2])
+        noises.append(noise)
 
-    return sensitivity_function(noises, powers)
-
-
-def sensitivity_q_noise(noises, powers):
-    return jnp.abs(noises[0] / powers[0])
+    return sensitivity_function(noises, powers, frequencies)
 
 
-def sensitivity_qamplfreq_noise(noises, powers, frequencies):
+def sensitivity_qamplfreq_noise(
+    noises: List[jnp.ndarray],
+    powers: List[jnp.ndarray],
+    frequencies: jnp.ndarray,
+) -> jnp.ndarray:
+    """
+    Sensitivity model combining quantum, amplitude, and frequency noise.
+
+    Expected inputs:
+    - noises[0]: quantum noise
+    - powers[0]: signal power used for normalization
+    - powers[1]: signal power proxy for amplitude noise scaling
+    - powers[2]: signal power proxy for frequency noise scaling
+
+    The amplitude and frequency noise terms are constructed as:
+    - amplitude_noise = powers[1] * 4e-9
+    - frequency_noise = (powers[2] * frequencies) * 1e-8
+      (implemented with transpose to match broadcasting expectations)
+
+    Parameters
+    ----------
+    noises
+        List of noise arrays.
+    powers
+        List of signal power arrays (see above).
+    frequencies
+        Frequency grid used to scale the frequency noise contribution.
+
+    Returns
+    -------
+    jnp.ndarray
+        Quadrature sum of noise contributions, normalized by the main signal power.
+    """
     q_noise = jnp.abs(noises[0])
-    ampl_noise = powers[1] * 4e-9
-    freq_noise = (powers[2].T * frequencies).T * 1e-8
-    return jnp.sqrt(q_noise**2 + ampl_noise**2 + freq_noise**2) / powers[0]
+    amplitude_noise = powers[1] * 4e-9
+    frequency_noise = (powers[2].T * frequencies).T * 1e-8
+    return jnp.sqrt(q_noise**2 + amplitude_noise**2 + frequency_noise**2) / powers[0]
 
-
-def evaluate_setups(
-        setups,  
-        frequencies, 
-        bounding_function,
-        calculate_loss,
-        sensitivity_function,
-        folder = None,
-        suffix = "",
-        reference_sensitivities = None,
-        parameters = None,
-        optimization_pairs = None,
-        bounds = None, 
-        homodyne=True,
-    ): 
-    """
-    Evaluates given setups and plots different information about them.
-    """
-    if parameters is not None:
-        for setup in setups:
-            update_setup(parameters, optimization_pairs, bounds, setup, bounding_function)
-
-    simulation_results = run_setups(setups, frequencies)
-    sensitivities = calculate_sensitivities(simulation_results, sensitivity_function, homodyne=homodyne)
-    powers = calculate_powers(simulation_results[0][0], *simulation_results[0][3:])
-
-    if reference_sensitivities is None:
-        reference_sensitivities = sensitivities
-
-    sensitivity_loss, penalty, violations = calculate_loss(sensitivities, reference_sensitivities, powers)
-    loss = float(sensitivity_loss + penalty)
-
-    if folder is not None:
-        if not os.path.exists(folder):
-            os.makedirs(folder, exist_ok=True)
-
-        plot_powers(*powers, suffix, folder)
-        plot_comparison(frequencies,  
-                        sensitivities,
-                        reference_sensitivities,
-                        folder,  
-                        name=f"sensitivity{suffix}")
-    
-    penalty_data = {}
-    penalty_data['loss'] = loss
-    penalty_data['sensitivity_loss'] = float(sensitivity_loss)
-    penalty_data['violations'] = violations.tolist()
-    penalty_data['penalty'] = float(penalty)
-    penalty_data['hard_side_powers'] = powers[0].tolist()
-    penalty_data['soft_side_powers'] = powers[1].tolist()
-    penalty_data['detector_powers'] = powers[2].tolist()
-    penalty_data['violating'] = bool(jnp.any(violations > 0))
-
-    return sensitivities, loss, penalty_data, setups[0]
-
-
-def get_initial_guess(
-        component_parameter_pairs,
-        setups,
-        frequencies,
-        bounds,
-        reference_sensitivities,
-        bounding_function,
-        calculate_loss,
-        sensitivity_function,
-        pool_size = 100,
-        random_seed = None
-    ):
-    """
-    Evaluates given setups with different sets of parameters.
-    """
-    rng = np.random.default_rng(random_seed)
-    guesses = jnp.array(rng.uniform(-10, 10, (pool_size, len(component_parameter_pairs))))
-
-    simulation_results = run_setups_with_parameter_sets(
-        setups,
-        frequencies,
-        guesses,
-        bounds,
-        component_parameter_pairs,
-        bounding_function
-    )
-
-    homodyne = False
-    for node in setups[0].nodes:
-        if node[1]["component"] == "qhd":
-            homodyne = True
-
-    sensitivities = calculate_sensitivities(simulation_results, sensitivity_function, homodyne=homodyne)
-    powers = calculate_powers(simulation_results[0][0], *simulation_results[0][3:])
-
-    losses, penalties, _ = calculate_loss(sensitivities, reference_sensitivities, powers)
-    losses = losses + penalties
-
-    return guesses[jnp.argmin(losses)], losses

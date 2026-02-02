@@ -3,27 +3,26 @@ import jax
 import json
 import optax
 import copy
+import time
 import numpy as np
 import jax.numpy as jnp
-from functools import partial
 import matplotlib.pyplot as plt
 from differometor.setups import voyager, uifo, constrain_inter_grid_cell_spaces
 from differometor.utils import (
     sigmoid_bounding, 
+    inverse_sigmoid_bounding,
     sensitivity_qamplfreq_noise, 
     calculate_sensitivities, 
-    calculate_powers, 
-    get_initial_guess,
-    evaluate_setups,
+    calculate_powers
 )
 from differometor.components import HARD_SIDE_POWER_THRESHOLD, SOFT_SIDE_POWER_THRESHOLD, DETECTOR_POWER_THRESHOLD
-from differometor.simulate import run_setups, run_build_step, simulate_in_parallel
+from differometor.simulate import run_setups, run_build_step, simulate
 
 
 def calculate_loss(
         sensitivities, 
         reference_sensitivities, 
-        powers,
+        powers
     ):
     # calculate power violations (i.e. penalty based on much the power at each component exceeds its threshold)
     hard_side_violations = jnp.maximum(powers[0] / HARD_SIDE_POWER_THRESHOLD - 1, 0).squeeze(1)
@@ -43,11 +42,6 @@ def calculate_loss(
     return losses, penalties, violations
 
 
-folder = "output_uifo"
-if not os.path.exists(folder):
-    os.makedirs(folder, exist_ok=True)
-
-
 ### Calculate the target sensitivity ###
 #--------------------------------------#
 
@@ -60,13 +54,13 @@ frequencies = jnp.logspace(jnp.log10(20), jnp.log10(5000), 50)
 setups = [voyager(mode="space_modulation")[0], voyager(mode="amplitude_modulation")[0], voyager(mode="frequency_modulation")[0]]
 
 # choose a sensitivity function that calculates sensitivities taking into account the three noise sources
-sensitivity_function = partial(sensitivity_qamplfreq_noise, frequencies=frequencies)
+sensitivity_function = sensitivity_qamplfreq_noise
 
 # simulate the setups
 simulation_results = run_setups(setups, frequencies)
 
 # calculate the sensitivity values taking into account the three noise sources
-reference_sensitivities = calculate_sensitivities(simulation_results, sensitivity_function)
+reference_sensitivities = calculate_sensitivities(simulation_results, sensitivity_function, frequencies)
 
 # calculate the light power at all components within the setup
 powers = calculate_powers(simulation_results[0][0], *simulation_results[0][3:])
@@ -128,21 +122,8 @@ for optimization_pair in optimization_pairs:
     upper_bounds.append(property_bounds[property_name][1])
 bounds = np.array([lower_bounds, upper_bounds])
 
-# initialize the uifo with 10 random sets of parameters and take the best parameter set as the initial guess
-print("\nEvaluating different sets of initial parameters...\n")
-initial_guess, losses = get_initial_guess(optimization_pairs, 
-                                          setups(), 
-                                          frequencies, 
-                                          bounds, 
-                                          reference_sensitivities,
-                                          sigmoid_bounding,
-                                          calculate_loss,
-                                          sensitivity_function,
-                                          pool_size=10,
-                                          random_seed=random_seed)
-print("\nInitial parameter evaluation done!")
-print("Best initial guess index: ", jnp.argmin(losses))
-print("Best initial guess loss: ", jnp.min(losses))
+print("\nRandomly initializing uifo parameters")
+initial_guess = inverse_sigmoid_bounding(np.random.uniform(bounds[0], bounds[1], size=(len(bounds[0]),)), bounds)
 
 # check if the random uifo uses a balanced homodyne detection scheme
 homodyne = False
@@ -163,25 +144,29 @@ def objective_function(parameters):
     bounded_parameters = sigmoid_bounding(parameters, bounds)
 
     # simulate the three modulation setups
-    q_results = simulate_in_parallel(bounded_parameters, *q_arrays[1:])
-    ampl_results = simulate_in_parallel(bounded_parameters, *ampl_arrays[1:])
-    freq_results = simulate_in_parallel(bounded_parameters, *freq_arrays[1:])
+    for array in [q_arrays, ampl_arrays, freq_arrays]:
+        array["optimized_parameters"] = bounded_parameters
+
+    q_results = simulate(**q_arrays)
+    ampl_results = simulate(**ampl_arrays)
+    freq_results = simulate(**freq_arrays)
     results = [(*q_results, *q_metadata), (*ampl_results, *ampl_metadata), (*freq_results, *freq_metadata)]
 
     # calculate the sensitivities taking into account the three noise sources
-    sensitivities = calculate_sensitivities(results, sensitivity_function, homodyne=homodyne)
+    sensitivities = calculate_sensitivities(results, sensitivity_function, frequencies, homodyne=homodyne)
 
     # calculate the light power at all components within the setup
     powers = calculate_powers(q_results[0], *q_metadata)
 
     # calculate the loss taking into account power violations
     sensitivity_loss, penalty, _ = calculate_loss(sensitivities, reference_sensitivities, powers)
-    return sensitivity_loss + penalty
+    penalty = penalty / (1.0 + penalty)
+    return sensitivity_loss + penalty, (sensitivity_loss, penalty, sensitivities, powers)
 
 
-grad_fn = jax.jit(jax.value_and_grad(objective_function))
+grad_fn = jax.jit(jax.value_and_grad(objective_function, has_aux=True))
 # warmup the function to compile it
-print("Compiling...")
+print("\nCompiling...")
 _ = grad_fn(initial_guess)
 print("Compilation done!")
 
@@ -192,34 +177,34 @@ optimizer = optax.chain(
 optimizer_state = optimizer.init(initial_guess)
 
 best_loss, best_params = 1e10, initial_guess
-params, no_improve_count, losses = initial_guess, 0, []
+params, losses = initial_guess, []
 
-print("\nOptimizing...\n")
-for i in range(10):
-    loss, grads = grad_fn(params)
-
-    if i % 100 == 0:
-        print(f"Iteration {i}: Loss = {loss}")
+print("\nOptimizing... (only 100 iterations for demonstration)\n")
+for i in range(100):
+    start = time.time()
+    (loss, (sensitivity_loss, penalty, sensitivities, powers)), grads = grad_fn(params)
 
     if loss < best_loss - 1e-4:
-        best_loss, best_params, no_improve_count = loss, params, 0
-        print(f"Iteration {i}: New best loss = {loss}")
+        best_loss, best_params = loss, params
+        print(f"Iteration {i}: New best loss = {float(loss):.4f}, Penalty = {float(penalty):.4f}, Time = {(time.time()-start):.4f}s")
     else:
-        no_improve_count += 1
+        print(f"Iteration {i}: Loss = {float(loss):.4f}, Penalty = {float(penalty):.4f}, Time = {(time.time()-start):.4f}s")
 
     updates, optimizer_state = optimizer.update(grads, optimizer_state, params)
     params = optax.apply_updates(params, updates)
     losses.append(float(loss))
 
-    # if the loss has not improved (< best_loss - 1e-4) over 1000 iterations, stop the optimization
-    if no_improve_count > 1000:
-        break
 print("\nOptimization done!\n")
+print("Evaluating...")
 
-with open(f"{folder}/optimization_parameters.json", "w") as f:
+folder = "examples/results/uifo_optimization"
+if not os.path.exists(folder):
+    os.makedirs(folder, exist_ok=True)
+
+with open(f"{folder}/parameters.json", "w") as f:
     json.dump(best_params.tolist(), f, indent=4)
 
-with open(f"{folder}/optimization_losses.json", "w") as f:
+with open(f"{folder}/losses.json", "w") as f:
     json.dump(losses, f, indent=4)
 
 plt.figure()
@@ -229,21 +214,44 @@ plt.ylabel("Loss")
 plt.axhline(0, color="red", linestyle="--")
 plt.grid()
 plt.tight_layout()
-plt.savefig(f"{folder}/optimization_losses.png")
+plt.savefig(f"{folder}/losses.png")
+plt.close()
 
-print("Evaluating...")
-(best_sensitivities, loss, penalty_data, best_setup) = evaluate_setups(setups(),
-                                                                        frequencies,
-                                                                        sigmoid_bounding,
-                                                                        calculate_loss,
-                                                                        sensitivity_function,
-                                                                        folder,
-                                                                        "_best",
-                                                                        reference_sensitivities,
-                                                                        best_params,
-                                                                        optimization_pairs,
-                                                                        bounds,
-                                                                        homodyne=homodyne)
+(loss, (sensitivity_loss, penalty, sensitivities, powers)), grads = grad_fn(best_params)
+
+def plot_powers(powers, cutoff, name):
+    powers = powers.squeeze()
+    x = np.arange(powers.shape[0])
+
+    plt.figure()
+    plt.bar(x, powers)
+    plt.axhline(y=cutoff, color="r", linestyle="--")
+    plt.yscale("log")
+    plt.xlabel("component")
+    plt.ylabel("Power [W]")
+
+    plt.tight_layout()
+    plt.savefig(f"{folder}/powers_{name}.png")
+    plt.close()
+
+plot_powers(powers[0], HARD_SIDE_POWER_THRESHOLD, "hard_side")
+plot_powers(powers[1], SOFT_SIDE_POWER_THRESHOLD, "soft_side")
+plot_powers(powers[2], DETECTOR_POWER_THRESHOLD, "detector")
+
+
+plt.figure()
+plt.plot(frequencies, sensitivities, label="Optimized Sensitivity")
+plt.plot(frequencies, reference_sensitivities, label="Target Sensitivity")
+plt.xscale("log")
+plt.yscale("log")
+plt.xlabel("Frequency (Hz)")
+plt.ylabel("Sensitivity [/sqrt(Hz)]")
+plt.legend()
+plt.grid()
+plt.tight_layout()
+plt.savefig(f"{folder}/sensitivities.png")
+plt.close()
+
 
 print(f"Evaluation done! You can find the results in the {folder} directory.")
 print(f"Loss of best setup: {loss}")

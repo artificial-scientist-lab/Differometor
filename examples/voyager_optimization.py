@@ -8,6 +8,7 @@ import numpy as np
 import jax
 import optax
 import json
+import os
 
 
 ### Calculate the target sensitivity ###
@@ -77,7 +78,8 @@ initial_guess = jnp.array(np.random.uniform(-10, 10, len(optimization_pairs)))
 def objective_function(optimized_parameters):
     # map the parameters to between 0 and 1 and then to their respective bounds
     optimized_parameters = sigmoid_bounding(optimized_parameters, bounds)
-    carrier, signal, noise = df.simulate_in_parallel(optimized_parameters, *simulation_arrays[1:])
+    simulation_arrays["optimized_parameters"] = optimized_parameters
+    carrier, signal, noise = df.simulate(**simulation_arrays)
     powers = demodulate_signal_power(carrier, signal)
     powers = powers[detector_ports]
     powers = powers[0] - powers[1]
@@ -120,10 +122,14 @@ for i in range(50000):
     if no_improve_count > 1000:
         break
 
-with open("voyager_optimization_parameters.json", "w") as f:
+folder = "examples/results/voyager_optimization"
+if not os.path.exists(folder):
+    os.makedirs(folder, exist_ok=True)
+
+with open(f"{folder}/parameters.json", "w") as f:
     json.dump(best_params.tolist(), f, indent=4)
 
-with open("voyager_optimization_losses.json", "w") as f:
+with open(f"{folder}/losses.json", "w") as f:
     json.dump(losses, f, indent=4)
 
 plt.figure()
@@ -133,7 +139,7 @@ plt.ylabel("Loss")
 plt.axhline(0, color="red", linestyle="--")
 plt.grid()
 plt.tight_layout()
-plt.savefig("voyager_optimization_loss.png")
+plt.savefig(f"{folder}/losses.png")
 
 
 ### Calculate the sensitivity of the best found setup ###
@@ -158,4 +164,4 @@ plt.ylabel("Sensitivity [/sqrt(Hz)]")
 plt.legend()
 plt.grid()
 plt.tight_layout()
-plt.savefig("voyager_optimization_sensitivity.png")
+plt.savefig(f"{folder}/sensitivities.png")

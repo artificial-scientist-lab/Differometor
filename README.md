@@ -10,6 +10,8 @@
 | [**Development**](#development)
 | [**Citing Differometor**](#citing-differometor)
 
+<img src="media/differometor.png" alt="workflow" width="400"/>
+
 ### Differometor is a differentiable frequency domain interferometer simulator
 
 You can use it to:
@@ -27,11 +29,11 @@ Differometor is implemented in Python using the [JAX](https://docs.jax.dev/en/la
 
 ## Install Guide
 
-The installation was tested on Ubuntu 24.04.1 LTS and on SUSE Linux Enterprise Server 15 SP6 with Python 3.11. The installation of Differometor will automatically install JAX (0.5.0), Optax (0.2.4), NumPy and Matplotlib. Other package versions may work, but have not been tested.
+The installation was tested on Ubuntu 24.04.1 LTS and on SUSE Linux Enterprise Server 15 SP6 with Python 3.11. The installation of Differometor will automatically install jax, optax, numpy and matplotlib. The installation was tested with jax==0.9.0, optax==0.2.6 and CUDA 13. Other package versions might work as well.
 
 ### From PyPI
 
-Create a virtual environment of your choice and install Differometor via pip. For example:
+This will install the CPU version of Differometor. The GPU version is significantly faster (see GPU support below). Create a virtual environment of your choice and install Differometor via pip. For example:
 
 ```bash
 virtualenv venv
@@ -40,6 +42,8 @@ pip install differometor
 ```
 
 ### Development mode
+
+This will install the CPU version of Differometor. The GPU version is significantly faster (see GPU support below). Git clone Differometor, create a virtual environment of your choice and install Differometor in edit mode. For example:
 
 ```bash
 git clone https://github.com/artificial-scientist-lab/Differometor differometor
@@ -51,10 +55,10 @@ pip install -e .
 
 ### GPU support
 
-Both installation methods above automatically install the CPU version of JAX. To upgrade to the GPU version with CUDA 12, please use:
+Both installation methods above automatically install the CPU version of JAX. Differometor on GPU is significantly faster. To upgrade to the GPU version with CUDA 13, please activate your virtual environment and use:
 
 ```bash
-pip install --upgrade "jax[cuda12]==0.5.0"
+pip install --upgrade "jax[cuda13]"
 ```
 
 
@@ -93,7 +97,7 @@ A good way to familiarize yourself with Differometor is to take a look at the [e
    * [Sensitivity of Advanced LIGO Setup](examples/aligo.py): Computes the strain sensitivity of a simplified aLIGO setup. Compare with the corresponding [Finesse example](https://finesse.ifosim.org/docs/latest/examples/09_aligo_sensitivity.html).
    * [Sensitivity of Voyager Setup](examples/voyager.py): Computes the strain sensitivity of the Voyager setup using balanced homodyne detection.
    * [Sensitivity Optimization of Voyager Setup](examples/voyager_optimization.py): Optimizes the sensitivity of the Voyager setup. 
-   * [Sensitivity of a pretrained UIFO Setup](examples/uifo.py): Computes the strain sensitivity of a pretrained UIFO and compares it to Voyager.
+   * [Sensitivity of a pre-optimized UIFO Setup](examples/uifo.py): Computes the strain sensitivity of a pre-optimized UIFO and compares it to Voyager.
    * [Sensitivity Optimization of UIFO Setup](examples/uifo_optimization.py): Optimizes the sensitivity of an UIFO.
 
 ### Optical Cavity Simulation 
@@ -139,7 +143,7 @@ plt.ylabel("Power (W)")
 plt.grid()
 plt.legend()
 plt.tight_layout()
-plt.savefig("output_cavity.png")
+plt.savefig("examples/results/cavity.png")
 ```
 
 It computes and plots the power outputs at the three detectors against the tuning of the left cavity mirror:
@@ -161,6 +165,7 @@ import numpy as np
 import jax
 import optax
 import json
+import os
 
 
 ### Calculate the target sensitivity ###
@@ -230,7 +235,8 @@ initial_guess = jnp.array(np.random.uniform(-10, 10, len(optimization_pairs)))
 def objective_function(optimized_parameters):
     # map the parameters to between 0 and 1 and then to their respective bounds
     optimized_parameters = sigmoid_bounding(optimized_parameters, bounds)
-    carrier, signal, noise = df.simulate_in_parallel(optimized_parameters, *simulation_arrays[1:])
+    simulation_arrays["optimized_parameters"] = optimized_parameters
+    carrier, signal, noise = df.simulate(**simulation_arrays)
     powers = demodulate_signal_power(carrier, signal)
     powers = powers[detector_ports]
     powers = powers[0] - powers[1]
@@ -273,10 +279,14 @@ for i in range(50000):
     if no_improve_count > 1000:
         break
 
-with open("voyager_optimization_parameters.json", "w") as f:
+folder = "examples/results/voyager_optimization"
+if not os.path.exists(folder):
+    os.makedirs(folder, exist_ok=True)
+
+with open(f"{folder}/parameters.json", "w") as f:
     json.dump(best_params.tolist(), f, indent=4)
 
-with open("voyager_optimization_losses.json", "w") as f:
+with open(f"{folder}/losses.json", "w") as f:
     json.dump(losses, f, indent=4)
 
 plt.figure()
@@ -286,7 +296,7 @@ plt.ylabel("Loss")
 plt.axhline(0, color="red", linestyle="--")
 plt.grid()
 plt.tight_layout()
-plt.savefig("voyager_optimization_loss.png")
+plt.savefig(f"{folder}/losses.png")
 
 
 ### Calculate the sensitivity of the best found setup ###
@@ -311,10 +321,10 @@ plt.ylabel("Sensitivity [/sqrt(Hz)]")
 plt.legend()
 plt.grid()
 plt.tight_layout()
-plt.savefig("voyager_optimization_sensitivity.png")
+plt.savefig(f"{folder}/sensitivities.png")
 ```
 
-The output figures show that after 6000 iterations, the optimization successfully found a parameter set with which the Voyager setup has a better sensitivity than the original design. However, as we did not impose any physical constraints on the parameters, the optimized setup is likely not physically realizable. Differometor supports the implementation of such physical constraints. 
+The example output figures show that after 6000 iterations, the optimization successfully found a parameter set with which the Voyager setup has a better sensitivity than the original design. However, as we did not impose any physical constraints on the parameters, the optimized setup is likely not physically realizable. Differometor supports the implementation of such physical constraints (see [Sensitivity Optimization of UIFO Setup](examples/uifo_optimization.py)). 
 
 <img src="media/loss.png" alt="loss" width="500"/>
 <img src="media/sensitivity.png" alt="loss" width="500"/>
@@ -421,7 +431,7 @@ To cite this repository, please use the following BibTeX entry:
   author = {Jonathan Klimesch and Yehonathan Drori and Rana X Adhikari and Mario Krenn},
   title = {Differometor: A Differentiable Interferometer Simulator for the Computational Design of Gravitational Wave Detectors},
   url = {http://github.com/artificial-scientist-lab/Differometor},
-  version = {0.0.2},
+  version = {0.0.3},
   year = {2025},
 }
 ```
