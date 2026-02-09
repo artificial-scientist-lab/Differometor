@@ -425,7 +425,9 @@ def build(setup: Setup):
           qhd_parameter_indices, qhd_placing_indices, linked_indices, linking_function_indices, indices_to_link)`
         as `jax.numpy` arrays.
     metadata_tuple:
-        `(detector_indices, mirror_indices, beamsplitter_indices, isolator_indices)` as integer arrays.
+        `(detector_indices, mirror_indices, beamsplitter_indices, isolator_indices, port_to_index)`
+        where the first four entries are integer arrays and `port_to_index` maps string keys of the form
+        `"component.port.direction"` to carrier indices.
 
     Notes
     -----
@@ -462,6 +464,7 @@ def build(setup: Setup):
     free_masses = []
     signal_frequency_position = 0
     surfaces_to_refractive_index_parameter_position = defaultdict(dict)
+    port_to_index = {}
     mirror_indices = []
     beamsplitter_indices = []
     isolator_indices = []
@@ -1394,6 +1397,19 @@ def build(setup: Setup):
             system_size_for_sidebands=system_size,
         )
 
+    # -----------------------------------------------------------------
+    # Build port-to-index lookup for carrier ports.
+    # -----------------------------------------------------------------
+    for node, data in setup.nodes(data=True):
+        component = data.get("component")
+        if component not in PORT_DICTS:
+            continue
+
+        node_index = matrix_positions[node]
+        for port_name, port_offset in PORT_DICTS[component].items():
+            port_to_index[f"{node}.{port_name}.in"] = node_index + port_offset
+            port_to_index[f"{node}.{port_name}.out"] = node_index + port_offset + 1
+
     # Convert linked parameter names to parameter index positions.
     linked_indices = [parameter_names.index(name) for name in linked_names]
     if len(linked_indices) == 0:
@@ -1421,6 +1437,7 @@ def build(setup: Setup):
             jnp.array(mirror_indices, dtype=int),
             jnp.array(beamsplitter_indices, dtype=int),
             jnp.array(isolator_indices, dtype=int),
+            port_to_index,
         ),
     )
 

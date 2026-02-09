@@ -5,7 +5,7 @@ import jax.numpy as jnp
 import matplotlib.pyplot as plt
 from differometor.setups import Setup
 from differometor.setups import voyager
-from differometor.components import demodulate_signal_power
+from differometor.plot import visualize_setup
 
 
 UIFO_TYPE = "800_3000" # options: "20_5000", "800_3000"
@@ -30,14 +30,14 @@ frequencies = jnp.array(uifo_test_data["frequencies"]) if UIFO_TYPE == "800_3000
 carrier, signal, noise, detector_ports, *_ = df.run(S, [("f", "frequency")], frequencies)
 
 # calculate the signal power at the detector ports
-powers = demodulate_signal_power(carrier, signal)
-powers = powers[detector_ports]
+signals = df.signal_detector(carrier, signal)
+signals = signals[detector_ports]
 
 # calculate the signal power from the two signal detectors for balanced homodyne detection
-powers = powers[0] - powers[1]
+signals = signals[0] - signals[1]
 
 # calculate the sensitivity
-voyager_sensitivity = noise / jnp.abs(powers)
+voyager_sensitivity = noise / jnp.abs(signals)
 
 print("Voyager sensitivity calculation done!")
 
@@ -54,20 +54,29 @@ with open(f"examples/data/uifo_{UIFO_TYPE}.json", "r") as f:
 S = Setup.from_data(uifo)
 
 # run the simulation with the frequency as the changing parameter
-carrier, signal, noise, detector_ports, *_ = df.run(S, [("f", "frequency")], frequencies)
+carrier, signal, noise, detector_ports, *metadata = df.run(S, [("f", "frequency")], frequencies)
+
+powers = df.power_detector(carrier)
 
 if len(detector_ports) == 1:
     # calculate the signal power at the detector port
-    powers = demodulate_signal_power(carrier, signal)
-    powers = powers[detector_ports].squeeze()
+    signals = df.signal_detector(carrier, signal)
+    detector_signals = signals[detector_ports].squeeze()
 else:
     # calculate the signal power at the detector ports (balanced homodyne detection scheme)
-    powers = demodulate_signal_power(carrier, signal)
-    powers = powers[detector_ports]
-    powers = powers[0] - powers[1]
+    signals = df.signal_detector(carrier, signal)
+    detector_signals = signals[detector_ports]
+    detector_signals = detector_signals[0] - detector_signals[1]
+
+df.visualize_setup(S,
+                    "examples/results/uifo/layout.html",
+                    powers=powers, 
+                    signals=signals, 
+                    frequencies=frequencies,
+                    port_to_index=metadata[-1])
 
 # calculate the sensitivity
-uifo_sensitivity = noise / jnp.abs(powers)
+uifo_sensitivity = noise / jnp.abs(detector_signals)
 
 if UIFO_TYPE == "800_3000":
     np.testing.assert_allclose(np.log(uifo_sensitivity), np.log(uifo_test_data["sensitivities"]), atol=1e-5, rtol=0)
@@ -85,4 +94,4 @@ plt.ylabel("Sensitivity [/sqrt(Hz)]")
 plt.legend()
 plt.grid()
 plt.tight_layout()
-plt.savefig("examples/results/uifo.png")
+plt.savefig("examples/results/uifo/sensitivities.png")

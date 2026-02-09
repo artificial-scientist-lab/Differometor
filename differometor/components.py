@@ -828,7 +828,7 @@ def power_detector(solution: jnp.ndarray) -> jnp.ndarray:
     return 0.5 * EPSILON_0C * jnp.abs(solution) ** 2
 
 
-def demodulate_signal_power(carrier: jnp.ndarray, signal: jnp.ndarray) -> jnp.ndarray:
+def signal_detector(carrier: jnp.ndarray, signal: jnp.ndarray) -> jnp.ndarray:
     """
     Demodulate optical power for a single-frequency signal step.
 

@@ -2,7 +2,7 @@ import differometor as df
 from differometor.setups import voyager
 from differometor.utils import sigmoid_bounding, update_setup
 import jax.numpy as jnp
-from differometor.components import demodulate_signal_power
+from differometor.components import signal_detector
 import matplotlib.pyplot as plt
 import numpy as np
 import jax
@@ -24,7 +24,7 @@ frequencies = jnp.logspace(jnp.log10(20), jnp.log10(5000), 100)
 carrier, signal, noise, detector_ports, *_ = df.run(S, [("f", "frequency")], frequencies)
 
 # calculate the signal power at the detector ports
-powers = demodulate_signal_power(carrier, signal)
+powers = signal_detector(carrier, signal)
 powers = powers[detector_ports]
 
 # calculate the signal power from the two signal detectors for balanced homodyne detection
@@ -80,7 +80,7 @@ def objective_function(optimized_parameters):
     optimized_parameters = sigmoid_bounding(optimized_parameters, bounds)
     simulation_arrays["optimized_parameters"] = optimized_parameters
     carrier, signal, noise = df.simulate(**simulation_arrays)
-    powers = demodulate_signal_power(carrier, signal)
+    powers = signal_detector(carrier, signal)
     powers = powers[detector_ports]
     powers = powers[0] - powers[1]
     sensitivity = noise / jnp.abs(powers)
@@ -148,7 +148,7 @@ plt.savefig(f"{folder}/losses.png")
 update_setup(best_params, optimization_pairs, bounds, S)
 
 carrier, signal, noise, detector_ports, *_ = df.run(S, [("f", "frequency")], frequencies)
-powers = demodulate_signal_power(carrier, signal)
+powers = signal_detector(carrier, signal)
 powers = powers[detector_ports]
 powers = powers[0] - powers[1]
 sensitivity = noise / jnp.abs(powers)

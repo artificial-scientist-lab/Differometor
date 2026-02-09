@@ -1,6 +1,5 @@
 import differometor as df
 import jax.numpy as jnp
-from differometor.components import power_detector
 import matplotlib.pyplot as plt
 
 # define a simple cavity setup with three detectors
@@ -18,10 +17,15 @@ S.add("detector", "trns", target="m1", port="right", direction="out")
 tunings = jnp.linspace(-180, 180, 400)
 
 # run the simulation with the tuning as the changing parameter
-carrier, signal, noise, detector_ports, *_ = df.run(S, [("m0", "tuning")], tunings)
+carrier, signal, noise, detector_ports, *metadata = df.run(S, [("m0", "tuning")], tunings)
 
 # calculate the power
-powers = power_detector(carrier)
+powers = df.power_detector(carrier)
+
+df.visualize_setup(S, 
+                    "examples/results/cavity/layout.html",
+                    powers=powers,
+                    port_to_index=metadata[-1])
 
 # plot the power at the detector ports
 plt.figure()
@@ -34,4 +38,4 @@ plt.ylabel("Power (W)")
 plt.grid()
 plt.legend()
 plt.tight_layout()
-plt.savefig("examples/results/cavity.png")
+plt.savefig("examples/results/cavity/powers.png")

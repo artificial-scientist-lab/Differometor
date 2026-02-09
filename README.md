@@ -100,6 +100,8 @@ A good way to familiarize yourself with Differometor is to take a look at the [e
    * [Sensitivity of a pre-optimized UIFO Setup](examples/uifo.py): Computes the strain sensitivity of a pre-optimized UIFO and compares it to Voyager.
    * [Sensitivity Optimization of UIFO Setup](examples/uifo_optimization.py): Optimizes the sensitivity of an UIFO.
 
+Most of the examples will automatically generate visualizations of the setup layouts using Differometor's visualization functions for interferometric setups. 
+
 ### Optical Cavity Simulation 
 
 This [example](examples/cavity.py) shows how Differometor can simulate a Fabry-Pérot cavity shown in the image below.
@@ -422,6 +424,16 @@ You can connect components via spaces:
 Differometor is developed at the [Artificial Scientist Lab](https://uni-tuebingen.de/en/research/core-research/cluster-of-excellence-machine-learning/research/research/cluster-research-groups/professorships/machine-learning-in-science-ii/) under Prof. Mario Krenn at the University of Tübingen, Germany.
 
 
+## Build Process (for developers)
+
+Run:
+
+```bash
+python -m build
+python -m twine upload dist/*
+```
+
+
 ## Citing Differometor
 
 To cite this repository, please use the following BibTeX entry:
@@ -431,7 +443,7 @@ To cite this repository, please use the following BibTeX entry:
   author = {Jonathan Klimesch and Yehonathan Drori and Rana X Adhikari and Mario Krenn},
   title = {Differometor: A Differentiable Interferometer Simulator for the Computational Design of Gravitational Wave Detectors},
   url = {http://github.com/artificial-scientist-lab/Differometor},
-  version = {0.0.3},
-  year = {2025},
+  version = {0.0.4},
+  year = {2026},
 }
 ```

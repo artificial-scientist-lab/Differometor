@@ -20,7 +20,7 @@ import jax.numpy as jnp
 
 from typing import Any, Callable, List, Sequence, Tuple, Union
 
-from differometor.components import power_detector, demodulate_signal_power
+from differometor.components import power_detector, signal_detector
 
 
 def sigmoid_bounding(parameters: jnp.ndarray, bounds: jnp.ndarray) -> jnp.ndarray:
@@ -129,6 +129,7 @@ def calculate_powers(
     mirror_indices: jnp.ndarray,
     beamsplitter_indices: jnp.ndarray,
     isolator_indices: jnp.ndarray,
+    *args,
 ) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
     """
     Calculate powers at detectors and selected components and summarize by "hard" and "soft" sides.
@@ -315,7 +316,7 @@ def calculate_sensitivities(
         carrier_solution, signal_solution, noise, detector_indices = result[0], result[1], result[2], result[3]
 
         # Demodulate using carrier and signal solutions.
-        signal_powers = demodulate_signal_power(carrier_solution, signal_solution)
+        signal_powers = signal_detector(carrier_solution, signal_solution)
 
         # Extract signal powers at the detector ports.
         signal_powers = signal_powers[detector_indices]

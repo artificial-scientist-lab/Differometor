@@ -56,7 +56,9 @@ setups = [voyager(mode="space_modulation")[0], voyager(mode="amplitude_modulatio
 # choose a sensitivity function that calculates sensitivities taking into account the three noise sources
 sensitivity_function = sensitivity_qamplfreq_noise
 
-# simulate the setups
+# simulate the setups 
+# (simulation results include carrier, signal, noise, detector indices, mirror indices, beamsplitter indices, 
+# isolator indices, and a mapping from port names to indices)
 simulation_results = run_setups(setups, frequencies)
 
 # calculate the sensitivity values taking into account the three noise sources
