@@ -4,7 +4,8 @@ If you need to extend behavior, follow this order:
 
 1. Graph + placement:
    `_collect_nodes_to_skip` -> `_build_adjacency_and_attachments` ->
-   `_place_connected_nodes` -> `_place_edge_attached_nodes` -> `_reposition_detectors`.
+   `_place_connected_nodes` -> `_place_edge_attached_nodes` ->
+   `_reposition_detectors` -> `_orient_layout_detector_on_right`.
 2. Beam metrics + scaling:
    `_prepare_beam_source_config` -> `_build_beam_records` ->
    `_global_max_series_by_source` -> `_add_beam_traces`.
@@ -24,7 +25,7 @@ Important invariants for contributors:
 """
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import plotly.graph_objects as go
 from collections import defaultdict, deque
 import numpy as np
@@ -42,6 +43,177 @@ _HIDDEN_COMPONENTS = {"free_mass", "frequency", "qhd", "signal"}
 _DETECTOR_LIKE_COMPONENTS = {"detector", "qnoised"}
 _POWER_CARRIER_COMPONENTS = {"mirror", "beamsplitter", "directional_beamsplitter"}
 _START_NODE_TYPES = {"laser", "squeezer", "detector", "qnoised"}
+_DEFAULT_COLORS = {
+    "beamsplitter": "#1f77b4",
+    "directional_beamsplitter": "#ff7f0e",
+    "mirror": "#999999",
+    "laser": "#d62728",
+    "squeezer": "#9467bd",
+    "detector": "#8c564b",
+    "nothing": "#7f7f7f",
+    "unknown": "#17becf",
+}
+_LINE_TRACE_SPECS = {
+    "laser": {"width": 8, "name": "laser"},
+    "squeezer": {"width": 8, "name": "squeezer"},
+}
+_MARKER_TRACE_SPECS = {
+    "beamsplitter": {
+        "symbol": "square",
+        "size": 16,
+        "name": "beamsplitter",
+        "color_key": "beamsplitter",
+    },
+    "directional_beamsplitter": {
+        "symbol": "diamond",
+        "size": 16,
+        "name": "directional bs",
+        "color_key": "directional_beamsplitter",
+    },
+    "detector": {
+        "symbol": "triangle-right",
+        "size": 18,
+        "name": "detector",
+        "color_key": "detector",
+    },
+    "nothing": {
+        "symbol": "diamond-open",
+        "size": 14,
+        "name": "nothing",
+        "color_key": "nothing",
+    },
+    "unknown": {
+        "symbol": "circle",
+        "size": 12,
+        "name": "unknown",
+        "color_key": "unknown",
+    },
+}
+
+
+def _new_marker_trace_buckets():
+    return {
+        "beamsplitter": {"x": [], "y": [], "text": []},
+        "directional_beamsplitter": {"x": [], "y": [], "text": []},
+        "detector": {"x": [], "y": [], "text": [], "angle": []},
+        "nothing": {"x": [], "y": [], "text": []},
+        "unknown": {"x": [], "y": [], "text": []},
+    }
+
+
+def _new_line_trace_buckets():
+    return {
+        "laser": {"x": [], "y": [], "text": []},
+        "squeezer": {"x": [], "y": [], "text": []},
+    }
+
+
+def _new_source_hover_buckets():
+    return {
+        "laser": {"x": [], "y": [], "text": []},
+        "squeezer": {"x": [], "y": [], "text": []},
+    }
+
+
+def _new_left_dot_buckets():
+    return {
+        "mirror": {"x": [], "y": []},
+        "beamsplitter": {"x": [], "y": []},
+        "directional_beamsplitter": {"x": [], "y": []},
+    }
+
+
+@dataclass(frozen=True)
+class _LayoutConfig:
+    """Geometry parameters that control graph placement."""
+
+    min_space: float
+    length_scale: float
+    attachment_length: float
+
+
+@dataclass
+class _LayoutState:
+    """Placed setup graph plus orientation metadata consumed by render stages."""
+
+    node_components: dict
+    positions: dict
+    left_dirs: dict
+    nodes_to_skip: set
+    adjacency: dict
+
+
+@dataclass(frozen=True)
+class _RenderStyle:
+    """Static visual dimensions and colors derived from `min_space`."""
+
+    colors: dict[str, str]
+    mirror_length: float
+    mirror_thickness: float
+    source_length: float
+
+    @classmethod
+    def from_min_space(cls, min_space):
+        return cls(
+            colors=dict(_DEFAULT_COLORS),
+            mirror_length=0.65 * min_space,
+            mirror_thickness=0.12 * min_space,
+            source_length=0.6 * min_space,
+        )
+
+
+@dataclass(frozen=True)
+class _BeamRenderConfig:
+    """Beam width and hover geometry settings shared by traces and controls."""
+
+    min_space: float
+    source_length: float
+    min_beam_width: float
+    width_scale: float
+    max_beam_width: float | None
+
+
+@dataclass(frozen=True)
+class _ControlLayout:
+    """Plotly control payloads plus layout offsets needed to display them."""
+
+    sliders: list
+    updatemenus: list
+    top_margin: int
+    legend_y: float
+
+
+@dataclass
+class _ComponentTraceData:
+    """Mutable Plotly trace buckets for component symbols and hover helpers."""
+
+    marker_traces: dict = field(default_factory=_new_marker_trace_buckets)
+    line_traces: dict = field(default_factory=_new_line_trace_buckets)
+    mirror_boxes: list[dict] = field(default_factory=list)
+    source_hover_traces: dict = field(default_factory=_new_source_hover_buckets)
+    left_dots: dict = field(default_factory=_new_left_dot_buckets)
+    component_hover_x: list[float] = field(default_factory=list)
+    component_hover_y: list[float] = field(default_factory=list)
+    component_hover_text: list[str] = field(default_factory=list)
+    component_hover_sizes: list[float] = field(default_factory=list)
+
+    def add_marker(self, component, pos, hover, *, angle=None):
+        trace = self.marker_traces[component]
+        trace["x"].append(pos[0])
+        trace["y"].append(pos[1])
+        trace["text"].append(hover)
+        if angle is not None:
+            trace["angle"].append(angle)
+
+    def add_component_hover(self, pos, hover, component):
+        self.component_hover_x.append(pos[0])
+        self.component_hover_y.append(pos[1])
+        self.component_hover_text.append(hover)
+        self.component_hover_sizes.append(_component_hover_size(component))
+
+    def add_left_dot(self, component, pos):
+        self.left_dots[component]["x"].append(pos[0])
+        self.left_dots[component]["y"].append(pos[1])
 
 
 @dataclass
@@ -97,6 +269,17 @@ def _rotate_vec(vec, angle_deg):
     c = np.cos(angle_rad)
     s = np.sin(angle_rad)
     return np.array([c * vec[0] - s * vec[1], s * vec[0] + c * vec[1]])
+
+
+def _rotate_quarter_turn(vec, steps):
+    steps = int(steps) % 4
+    if steps == 0:
+        return np.asarray(vec, dtype=float)
+    if steps == 1:
+        return np.array([-vec[1], vec[0]], dtype=float)
+    if steps == 2:
+        return np.array([-vec[0], -vec[1]], dtype=float)
+    return np.array([vec[1], -vec[0]], dtype=float)
 
 
 def _add_connection(adjacency, node_a, node_b, port_a, port_b, distance, kind):
@@ -237,7 +420,16 @@ def _build_adjacency_and_attachments(
     return adjacency, edge_attached_nodes
 
 
-def _place_connected_nodes(setup, adjacency, node_components, nodes_to_skip, edge_attached_nodes, rng, min_space):
+def _choose_start_node(nodes_to_place, node_components):
+    candidates = [
+        name for name in nodes_to_place if node_components.get(name) in _START_NODE_TYPES
+    ]
+    pool = candidates if candidates else list(nodes_to_place)
+    # Deterministic anchor to avoid run-to-run random global rotations.
+    return sorted(pool, key=lambda name: str(name))[0]
+
+
+def _place_connected_nodes(setup, adjacency, node_components, nodes_to_skip, edge_attached_nodes, min_space):
     nodes_to_place = {
         name
         for name, _ in setup.nodes(data=True)
@@ -249,8 +441,7 @@ def _place_connected_nodes(setup, adjacency, node_components, nodes_to_skip, edg
     offset_x = 0.0
 
     while nodes_to_place:
-        candidates = [name for name in nodes_to_place if node_components.get(name) in _START_NODE_TYPES]
-        start_node = rng.choice(candidates or list(nodes_to_place))
+        start_node = _choose_start_node(nodes_to_place, node_components)
 
         positions[start_node] = np.array([offset_x, 0.0])
         start_connections = adjacency.get(start_node, [])
@@ -375,6 +566,161 @@ def _reposition_detectors(setup, positions, left_dirs, node_components, nodes_to
         else:
             best_idx = 0
         positions[node] = candidates[best_idx]
+
+
+def _rotate_layout_state(positions, left_dirs, visible_nodes, steps):
+    steps = int(steps) % 4
+    if steps == 0:
+        return
+    if not visible_nodes:
+        return
+
+    visible_positions = [positions[name] for name in visible_nodes if name in positions]
+    if not visible_positions:
+        return
+    center = np.mean(np.vstack(visible_positions), axis=0)
+
+    for name in list(positions.keys()):
+        vec = np.asarray(positions[name], dtype=float) - center
+        positions[name] = _rotate_quarter_turn(vec, steps) + center
+
+    for name, direction in list(left_dirs.items()):
+        if direction in _CARDINAL_DIRECTIONS:
+            left_dirs[name] = _rotate_direction(direction, steps)
+
+
+def _orient_layout_detector_on_right(positions, left_dirs, node_components, nodes_to_skip):
+    visible_nodes = [
+        name for name in positions.keys() if name not in nodes_to_skip
+    ]
+    detector_nodes = [
+        name
+        for name in visible_nodes
+        if node_components.get(name) in _DETECTOR_LIKE_COMPONENTS
+    ]
+    if not detector_nodes:
+        return
+
+    physical_detector_nodes = [
+        name for name in detector_nodes if node_components.get(name) == "detector"
+    ]
+    if physical_detector_nodes:
+        primary_detector = sorted(physical_detector_nodes, key=lambda name: str(name))[0]
+    else:
+        primary_detector = sorted(detector_nodes, key=lambda name: str(name))[0]
+
+    points = np.vstack([np.asarray(positions[name], dtype=float) for name in visible_nodes])
+    center = np.mean(points, axis=0)
+
+    def _rotate_points(steps):
+        rotated_points = {}
+        for name in visible_nodes:
+            vec = np.asarray(positions[name], dtype=float) - center
+            rotated_points[name] = _rotate_quarter_turn(vec, steps) + center
+        return rotated_points
+
+    # Choose the 90-degree orientation that places the primary detector as far
+    # to the right as possible. If two orientations are similarly rightward,
+    # prefer the one where the detector sits higher.
+    best_steps = 0
+    best_score = (-np.inf, -np.inf, -np.inf, -np.inf, -np.inf, -np.inf, -np.inf)
+    for steps in range(4):
+        rotated = _rotate_points(steps)
+        all_x = np.array([rotated[name][0] for name in visible_nodes], dtype=float)
+        det_x = np.array([rotated[name][0] for name in detector_nodes], dtype=float)
+        det_y = np.array([rotated[name][1] for name in detector_nodes], dtype=float)
+        primary_x = float(rotated[primary_detector][0])
+        primary_y = float(rotated[primary_detector][1])
+        rank_score = float(np.sum(all_x <= (primary_x + 1e-12)))
+        other_x = np.array(
+            [rotated[name][0] for name in visible_nodes if name != primary_detector],
+            dtype=float,
+        )
+        edge_gap = (
+            float(primary_x - float(np.max(other_x)))
+            if other_x.size > 0
+            else np.inf
+        )
+        center_gap = float(primary_x - float(np.mean(all_x)))
+        detector_group_gap = float(np.mean(det_x) - np.mean(all_x))
+        detector_group_y = float(np.mean(det_y))
+
+        score = (
+            primary_x,
+            detector_group_gap,
+            primary_y,
+            detector_group_y,
+            edge_gap,
+            rank_score,
+            center_gap,
+        )
+        if score > best_score:
+            best_score = score
+            best_steps = steps
+
+    _rotate_layout_state(positions, left_dirs, visible_nodes, best_steps)
+
+
+def _build_layout(setup, config):
+    """Run the complete placement pipeline and return a render-ready layout."""
+
+    node_components = {name: data.get("component", "") for name, data in setup.nodes(data=True)}
+    nodes_to_skip = _collect_nodes_to_skip(setup, node_components)
+    adjacency, edge_attached_nodes = _build_adjacency_and_attachments(
+        setup,
+        node_components,
+        nodes_to_skip,
+        config.min_space,
+        config.length_scale,
+        config.attachment_length,
+    )
+    positions, left_dirs, offset_x, component_spacing = _place_connected_nodes(
+        setup,
+        adjacency,
+        node_components,
+        nodes_to_skip,
+        edge_attached_nodes,
+        config.min_space,
+    )
+    _place_edge_attached_nodes(
+        edge_attached_nodes,
+        positions,
+        left_dirs,
+        config.min_space,
+        component_spacing,
+        offset_x,
+    )
+    _reposition_detectors(
+        setup,
+        positions,
+        left_dirs,
+        node_components,
+        nodes_to_skip,
+        config.attachment_length,
+    )
+    _orient_layout_detector_on_right(
+        positions,
+        left_dirs,
+        node_components,
+        nodes_to_skip,
+    )
+    return _LayoutState(
+        node_components=node_components,
+        positions=positions,
+        left_dirs=left_dirs,
+        nodes_to_skip=nodes_to_skip,
+        adjacency=adjacency,
+    )
+
+
+def _axis_ranges(positions, min_space):
+    xs = [pos[0] for pos in positions.values()]
+    ys = [pos[1] for pos in positions.values()]
+    margin = 1.5 * min_space
+    return (
+        [min(xs) - margin, max(xs) + margin],
+        [min(ys) - margin, max(ys) + margin],
+    )
 
 
 def _prepare_beam_source_config(powers, signals, frequencies, signal_index):
@@ -569,14 +915,19 @@ def _beam_hover_text(record, source_name, frame_idx, source_config):
     return "<br>".join(lines)
 
 
-def _beam_width_for_record(record, source_name, frame_idx, global_max_series_by_source, min_beam_width, width_scale, max_beam_width):
+def _beam_width_for_record(record, source_name, frame_idx, global_max_series_by_source, render_config):
     frame_global_max = float(global_max_series_by_source[source_name][frame_idx])
     record_max = float(record.max_series[source_name][frame_idx])
     if np.isfinite(record_max) and frame_global_max > 0:
         normalized = record_max / frame_global_max
     else:
         normalized = 0.0
-    return _beam_width_from_scale(normalized, min_beam_width, width_scale, max_beam_width)
+    return _beam_width_from_scale(
+        normalized,
+        render_config.min_beam_width,
+        render_config.width_scale,
+        render_config.max_beam_width,
+    )
 
 
 def _component_hover_clearance(component_name, min_space, source_length):
@@ -600,11 +951,7 @@ def _add_beam_traces(
     beam_records,
     source_config,
     global_max_by_source,
-    min_space,
-    source_length,
-    min_beam_width,
-    width_scale,
-    max_beam_width,
+    render_config,
 ):
     beam_legend_added = False
     beam_line_indices = []
@@ -618,9 +965,7 @@ def _add_beam_traces(
             source_name,
             frame_idx,
             global_max_by_source,
-            min_beam_width,
-            width_scale,
-            max_beam_width,
+            render_config,
         )
         hover_marker_size = _beam_hover_size_from_width(beam_width)
         hover_text = _beam_hover_text(record, source_name, frame_idx, source_config)
@@ -647,8 +992,16 @@ def _add_beam_traces(
         distance = float(np.linalg.norm(p1 - p0))
         if distance <= 1e-12:
             continue
-        start_clearance = _component_hover_clearance(record.source_component, min_space, source_length)
-        end_clearance = _component_hover_clearance(record.target_component, min_space, source_length)
+        start_clearance = _component_hover_clearance(
+            record.source_component,
+            render_config.min_space,
+            render_config.source_length,
+        )
+        end_clearance = _component_hover_clearance(
+            record.target_component,
+            render_config.min_space,
+            render_config.source_length,
+        )
         t0 = max(0.125, start_clearance / distance)
         t1 = min(0.875, 1.0 - end_clearance / distance)
         if t1 <= t0:
@@ -657,7 +1010,7 @@ def _add_beam_traces(
             t1 = min(0.55, center + 0.02)
             if t1 <= t0:
                 t0, t1 = 0.48, 0.52
-        n_hover_points = max(12, int(np.ceil(distance / max(min_space, 1e-9) * 24)))
+        n_hover_points = max(12, int(np.ceil(distance / max(render_config.min_space, 1e-9) * 24)))
         t = np.linspace(t0, t1, n_hover_points)
         hover_points = p0[None, :] + (p1 - p0)[None, :] * t[:, None]
         fig.add_trace(
@@ -713,14 +1066,9 @@ def _add_segment(trace, p0, p1, hover):
 
 def _collect_component_trace_data(
     setup,
-    positions,
-    left_dirs,
-    adjacency,
-    nodes_to_skip,
-    min_space,
-    mirror_length,
-    mirror_thickness,
-    source_length,
+    layout,
+    config,
+    style,
 ):
     """
     Convert placed nodes into Plotly-ready trace payloads.
@@ -734,29 +1082,15 @@ def _collect_component_trace_data(
     - If you add component-level hover areas, include them in the returned
       component hover arrays so hover priority remains predictable.
     """
-    marker_traces = {
-        "beamsplitter": {"x": [], "y": [], "text": []},
-        "directional_beamsplitter": {"x": [], "y": [], "text": []},
-        "detector": {"x": [], "y": [], "text": [], "angle": []},
-        "nothing": {"x": [], "y": [], "text": []},
-        "unknown": {"x": [], "y": [], "text": []},
-    }
-    line_traces = {
-        "laser": {"x": [], "y": [], "text": []},
-        "squeezer": {"x": [], "y": [], "text": []},
-    }
-    mirror_boxes = []
-    source_hover_traces = {
-        "laser": {"x": [], "y": [], "text": []},
-        "squeezer": {"x": [], "y": [], "text": []},
-    }
-    left_dots = {
-        "mirror": {"x": [], "y": []},
-        "beamsplitter": {"x": [], "y": []},
-        "directional_beamsplitter": {"x": [], "y": []},
-    }
-    component_hover_x, component_hover_y = [], []
-    component_hover_text, component_hover_sizes = [], []
+    positions = layout.positions
+    left_dirs = layout.left_dirs
+    adjacency = layout.adjacency
+    nodes_to_skip = layout.nodes_to_skip
+    min_space = config.min_space
+    mirror_length = style.mirror_length
+    mirror_thickness = style.mirror_thickness
+    source_length = style.source_length
+    trace_data = _ComponentTraceData()
     detector_angle_map = {"right": 0, "top": 90, "left": 180, "bottom": -90}
 
     for node, data in setup.nodes(data=True):
@@ -771,26 +1105,24 @@ def _collect_component_trace_data(
         hover = _node_hover_text(node, data, component)
 
         if component == "beamsplitter":
-            marker_traces["beamsplitter"]["x"].append(pos[0])
-            marker_traces["beamsplitter"]["y"].append(pos[1])
-            marker_traces["beamsplitter"]["text"].append(hover)
+            trace_data.add_marker("beamsplitter", pos, hover)
         elif component == "directional_beamsplitter":
-            marker_traces["directional_beamsplitter"]["x"].append(pos[0])
-            marker_traces["directional_beamsplitter"]["y"].append(pos[1])
-            marker_traces["directional_beamsplitter"]["text"].append(hover)
+            trace_data.add_marker("directional_beamsplitter", pos, hover)
         elif component == "detector":
             beam_dir = _beam_direction_for(node, adjacency, left_dirs)
-            marker_traces["detector"]["x"].append(pos[0])
-            marker_traces["detector"]["y"].append(pos[1])
-            marker_traces["detector"]["text"].append(hover)
-            marker_traces["detector"]["angle"].append(detector_angle_map.get(beam_dir, 0))
+            trace_data.add_marker(
+                "detector",
+                pos,
+                hover,
+                angle=detector_angle_map.get(beam_dir, 0),
+            )
         elif component == "mirror":
             beam_dir = _port_direction(left_dir, "right")
             half_x, half_y = _mirror_half_extents(beam_dir, mirror_length, mirror_thickness)
 
             x0, x1 = pos[0] - half_x, pos[0] + half_x
             y0, y1 = pos[1] - half_y, pos[1] + half_y
-            mirror_boxes.append(
+            trace_data.mirror_boxes.append(
                 {
                     "x": [x0, x1, x1, x0, x0],
                     "y": [y0, y0, y1, y1, y0],
@@ -805,7 +1137,7 @@ def _collect_component_trace_data(
             else:
                 p0 = (pos[0], pos[1] - source_length / 2)
                 p1 = (pos[0], pos[1] + source_length / 2)
-            _add_segment(line_traces[component], p0, p1, hover)
+            _add_segment(trace_data.line_traces[component], p0, p1, hover)
             # Dense invisible hover markers provide reliable full-length hover
             # coverage for source symbols in Plotly.
             p0_arr = np.array(p0, dtype=float)
@@ -813,22 +1145,15 @@ def _collect_component_trace_data(
             n_hover_points = max(14, int(np.ceil(source_length / max(min_space, 1e-9) * 28)))
             t = np.linspace(0.0, 1.0, n_hover_points)
             hover_points = p0_arr[None, :] + (p1_arr - p0_arr)[None, :] * t[:, None]
-            source_hover_traces[component]["x"].extend(hover_points[:, 0].tolist())
-            source_hover_traces[component]["y"].extend(hover_points[:, 1].tolist())
-            source_hover_traces[component]["text"].extend([hover] * n_hover_points)
+            trace_data.source_hover_traces[component]["x"].extend(hover_points[:, 0].tolist())
+            trace_data.source_hover_traces[component]["y"].extend(hover_points[:, 1].tolist())
+            trace_data.source_hover_traces[component]["text"].extend([hover] * n_hover_points)
         elif component == "nothing":
-            marker_traces["nothing"]["x"].append(pos[0])
-            marker_traces["nothing"]["y"].append(pos[1])
-            marker_traces["nothing"]["text"].append(hover)
+            trace_data.add_marker("nothing", pos, hover)
         else:
-            marker_traces["unknown"]["x"].append(pos[0])
-            marker_traces["unknown"]["y"].append(pos[1])
-            marker_traces["unknown"]["text"].append(hover)
+            trace_data.add_marker("unknown", pos, hover)
 
-        component_hover_x.append(pos[0])
-        component_hover_y.append(pos[1])
-        component_hover_text.append(hover)
-        component_hover_sizes.append(_component_hover_size(component))
+        trace_data.add_component_hover(pos, hover, component)
 
         if component in {"mirror", "beamsplitter", "directional_beamsplitter"}:
             indicator_dir = _DIRECTION_VECTORS[left_dir]
@@ -840,34 +1165,15 @@ def _collect_component_trace_data(
             else:
                 indicator_length = 0.14 * min_space
             center = pos + indicator_dir * indicator_length
-            left_dots[component]["x"].append(center[0])
-            left_dots[component]["y"].append(center[1])
+            trace_data.add_left_dot(component, center)
 
-    return (
-        marker_traces,
-        line_traces,
-        mirror_boxes,
-        source_hover_traces,
-        left_dots,
-        component_hover_x,
-        component_hover_y,
-        component_hover_text,
-        component_hover_sizes,
-    )
+    return trace_data
 
 
 def _add_component_traces(
     fig,
-    marker_traces,
-    line_traces,
-    mirror_boxes,
-    source_hover_traces,
-    left_dots,
-    component_hover_x,
-    component_hover_y,
-    component_hover_text,
-    component_hover_sizes,
-    colors,
+    trace_data,
+    style,
 ):
     """
     Append all component traces (visible + helper hover/dot traces) to `fig`.
@@ -876,12 +1182,10 @@ def _add_component_traces(
     Keep `legendgroup` synchronized for visible and helper traces to ensure grouped
     legend toggling works consistently.
     """
-    line_specs = {
-        "laser": {"width": 8, "name": "laser"},
-        "squeezer": {"width": 8, "name": "squeezer"},
-    }
-    for component, spec in line_specs.items():
-        trace = line_traces[component]
+    colors = style.colors
+
+    for component, spec in _LINE_TRACE_SPECS.items():
+        trace = trace_data.line_traces[component]
         if not trace["x"]:
             continue
         fig.add_trace(
@@ -897,7 +1201,7 @@ def _add_component_traces(
             )
         )
 
-    for i, box in enumerate(mirror_boxes):
+    for i, box in enumerate(trace_data.mirror_boxes):
         fig.add_trace(
             go.Scatter(
                 x=box["x"],
@@ -915,7 +1219,7 @@ def _add_component_traces(
         )
 
     for component in ("laser", "squeezer"):
-        trace = source_hover_traces[component]
+        trace = trace_data.source_hover_traces[component]
         if not trace["x"]:
             continue
         fig.add_trace(
@@ -935,40 +1239,8 @@ def _add_component_traces(
             )
         )
 
-    marker_specs = {
-        "beamsplitter": {
-            "symbol": "square",
-            "size": 16,
-            "name": "beamsplitter",
-            "color_key": "beamsplitter",
-        },
-        "directional_beamsplitter": {
-            "symbol": "diamond",
-            "size": 16,
-            "name": "directional bs",
-            "color_key": "directional_beamsplitter",
-        },
-        "detector": {
-            "symbol": "triangle-right",
-            "size": 18,
-            "name": "detector",
-            "color_key": "detector",
-        },
-        "nothing": {
-            "symbol": "diamond-open",
-            "size": 14,
-            "name": "nothing",
-            "color_key": "nothing",
-        },
-        "unknown": {
-            "symbol": "circle",
-            "size": 12,
-            "name": "unknown",
-            "color_key": "unknown",
-        },
-    }
-    for component, spec in marker_specs.items():
-        trace = marker_traces[component]
+    for component, spec in _MARKER_TRACE_SPECS.items():
+        trace = trace_data.marker_traces[component]
         if not trace["x"]:
             continue
         marker_style = dict(
@@ -996,7 +1268,7 @@ def _add_component_traces(
         )
 
     for component in ("mirror", "beamsplitter", "directional_beamsplitter"):
-        dots = left_dots.get(component, {})
+        dots = trace_data.left_dots.get(component, {})
         if not dots.get("x"):
             continue
         fig.add_trace(
@@ -1011,15 +1283,19 @@ def _add_component_traces(
             )
         )
 
-    if component_hover_x:
+    if trace_data.component_hover_x:
         fig.add_trace(
             go.Scatter(
-                x=component_hover_x,
-                y=component_hover_y,
+                x=trace_data.component_hover_x,
+                y=trace_data.component_hover_y,
                 mode="markers",
-                marker=dict(size=component_hover_sizes, color="rgba(0,0,0,0)", line=dict(width=0)),
+                marker=dict(
+                    size=trace_data.component_hover_sizes,
+                    color="rgba(0,0,0,0)",
+                    line=dict(width=0),
+                ),
                 showlegend=False,
-                text=component_hover_text,
+                text=trace_data.component_hover_text,
                 hovertemplate="%{text}<extra></extra>",
             )
         )
@@ -1031,9 +1307,7 @@ def _beam_trace_updates(
     frame_idx,
     source_config,
     global_max_by_source,
-    min_beam_width,
-    width_scale,
-    max_beam_width,
+    render_config,
 ):
     frame_count = source_config.frame_count_by_source[source_name]
     frame_idx = int(np.clip(frame_idx, 0, frame_count - 1))
@@ -1048,9 +1322,7 @@ def _beam_trace_updates(
             source_name,
             frame_idx,
             global_max_by_source,
-            min_beam_width,
-            width_scale,
-            max_beam_width,
+            render_config,
         )
         beam_hover = _beam_hover_text(record, source_name, frame_idx, source_config)
         line_widths.append(beam_width)
@@ -1066,18 +1338,13 @@ def _build_controls(
     beam_records,
     source_config,
     global_max_by_source,
-    min_beam_width,
-    width_scale,
-    max_beam_width,
+    render_config,
 ):
     """
     Build Plotly UI controls for beam-width views.
 
-    Returns:
-    - `sliders`: optional signal-frequency slider configuration
-    - `updatemenus`: optional powers/signals toggle buttons
-    - `top_margin`: layout top margin required for visible controls
-    - `legend_y`: y-position of the legend row
+    Returns a `_ControlLayout` with optional Plotly slider/button configs plus
+    the top margin and legend y-position needed to keep controls visible.
 
     Extension point:
     - Add new view modes by extending `beam_updates(...)` usage and adding
@@ -1097,9 +1364,7 @@ def _build_controls(
             frame_idx,
             source_config,
             global_max_by_source,
-            min_beam_width,
-            width_scale,
-            max_beam_width,
+            render_config,
         )
 
     has_signal_slider = (
@@ -1192,7 +1457,12 @@ def _build_controls(
     row_count = 1 + int(has_mode_buttons) + int(has_signal_slider)
     top_margin = 80 + 30 * (row_count - 1)
 
-    return sliders, updatemenus, top_margin, legend_y
+    return _ControlLayout(
+        sliders=sliders,
+        updatemenus=updatemenus,
+        top_margin=top_margin,
+        legend_y=legend_y,
+    )
 
 
 def _resolve_html_output_path(output_file):
@@ -1243,77 +1513,38 @@ def visualize_setup(
     scaled by `powers` and/or `signals` (switchable via in-HTML buttons).
 
     `output_file` is the output HTML filepath.
+    `seed` is retained for API compatibility; layout placement is deterministic.
     """
-    del show_labels, dpi  # Retained for API compatibility.
+    del show_labels, dpi, seed  # Retained for API compatibility.
     out_path = _resolve_html_output_path(output_file)
     if attachment_length is None:
         attachment_length = 0.6 * min_space
 
-    rng = np.random.default_rng(seed)
-    node_components = {name: data.get("component", "") for name, data in setup.nodes(data=True)}
-    nodes_to_skip = _collect_nodes_to_skip(setup, node_components)
-    adjacency, edge_attached_nodes = _build_adjacency_and_attachments(
-        setup,
-        node_components,
-        nodes_to_skip,
-        min_space,
-        length_scale,
-        attachment_length,
+    layout_config = _LayoutConfig(
+        min_space=min_space,
+        length_scale=length_scale,
+        attachment_length=attachment_length,
     )
-    positions, left_dirs, offset_x, component_spacing = _place_connected_nodes(
-        setup,
-        adjacency,
-        node_components,
-        nodes_to_skip,
-        edge_attached_nodes,
-        rng,
-        min_space,
-    )
-    _place_edge_attached_nodes(
-        edge_attached_nodes,
-        positions,
-        left_dirs,
-        min_space,
-        component_spacing,
-        offset_x,
-    )
-    _reposition_detectors(
-        setup,
-        positions,
-        left_dirs,
-        node_components,
-        nodes_to_skip,
-        attachment_length,
-    )
+    layout = _build_layout(setup, layout_config)
 
-    if not positions:
+    if not layout.positions:
         return _render_empty_setup(out_path)
 
-    xs = [pos[0] for pos in positions.values()]
-    ys = [pos[1] for pos in positions.values()]
-    margin = 1.5 * min_space
-    x_range = [min(xs) - margin, max(xs) + margin]
-    y_range = [min(ys) - margin, max(ys) + margin]
-
-    mirror_length = 0.65 * min_space
-    mirror_thickness = 0.12 * min_space
-    source_length = 0.6 * min_space
-    colors = {
-        "beamsplitter": "#1f77b4",
-        "directional_beamsplitter": "#ff7f0e",
-        "mirror": "#999999",
-        "laser": "#d62728",
-        "squeezer": "#9467bd",
-        "detector": "#8c564b",
-        "nothing": "#7f7f7f",
-        "unknown": "#17becf",
-    }
+    x_range, y_range = _axis_ranges(layout.positions, min_space)
+    style = _RenderStyle.from_min_space(min_space)
+    beam_render_config = _BeamRenderConfig(
+        min_space=min_space,
+        source_length=style.source_length,
+        min_beam_width=min_beam_width,
+        width_scale=power_width_scale,
+        max_beam_width=max_beam_width,
+    )
 
     source_config = _prepare_beam_source_config(powers, signals, frequencies, signal_index)
     beam_records = _build_beam_records(
         setup,
-        positions,
-        node_components,
+        layout.positions,
+        layout.node_components,
         port_to_index,
         source_config,
     )
@@ -1325,58 +1556,29 @@ def visualize_setup(
         beam_records,
         source_config,
         global_max_by_source,
-        min_space,
-        source_length,
-        min_beam_width,
-        power_width_scale,
-        max_beam_width,
+        beam_render_config,
     )
-    _add_attachment_trace(fig, setup, positions, nodes_to_skip)
+    _add_attachment_trace(fig, setup, layout.positions, layout.nodes_to_skip)
 
-    (
-        marker_traces,
-        line_traces,
-        mirror_boxes,
-        source_hover_traces,
-        left_dots,
-        component_hover_x,
-        component_hover_y,
-        component_hover_text,
-        component_hover_sizes,
-    ) = _collect_component_trace_data(
+    component_trace_data = _collect_component_trace_data(
         setup,
-        positions,
-        left_dirs,
-        adjacency,
-        nodes_to_skip,
-        min_space,
-        mirror_length,
-        mirror_thickness,
-        source_length,
+        layout,
+        layout_config,
+        style,
     )
     _add_component_traces(
         fig,
-        marker_traces,
-        line_traces,
-        mirror_boxes,
-        source_hover_traces,
-        left_dots,
-        component_hover_x,
-        component_hover_y,
-        component_hover_text,
-        component_hover_sizes,
-        colors,
+        component_trace_data,
+        style,
     )
 
     beam_target_trace_indices = beam_line_trace_indices + beam_hover_trace_indices
-    sliders, updatemenus, top_margin, legend_y = _build_controls(
+    controls = _build_controls(
         beam_target_trace_indices,
         beam_records,
         source_config,
         global_max_by_source,
-        min_beam_width,
-        power_width_scale,
-        max_beam_width,
+        beam_render_config,
     )
 
     fig.update_layout(
@@ -1387,7 +1589,7 @@ def visualize_setup(
         legend=dict(
             orientation="h",
             x=0.5,
-            y=legend_y,
+            y=controls.legend_y,
             xanchor="center",
             yanchor="bottom",
             groupclick="togglegroup",
@@ -1395,9 +1597,9 @@ def visualize_setup(
             bordercolor="rgba(0,0,0,0.2)",
             borderwidth=1,
         ),
-        updatemenus=updatemenus,
-        sliders=sliders,
-        margin=dict(l=20, r=20, t=top_margin, b=20),
+        updatemenus=controls.updatemenus,
+        sliders=controls.sliders,
+        margin=dict(l=20, r=20, t=controls.top_margin, b=20),
         showlegend=True,
     )
 
