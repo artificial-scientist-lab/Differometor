@@ -273,6 +273,7 @@ def calculate_sensitivities(
     sensitivity_function: Callable[[List[jnp.ndarray], List[jnp.ndarray], jnp.ndarray], jnp.ndarray],
     frequencies: jnp.ndarray,
     homodyne: bool = True,
+    transfer_floor: float = 0.0,
 ) -> jnp.ndarray:
     """
     Compute setup sensitivities from simulation results.
@@ -303,6 +304,10 @@ def calculate_sensitivities(
         but depends on the rest of your pipeline.
     homodyne
         If True, treat the first two detector channels as a balanced homodyne pair.
+    transfer_floor
+        Optional lower bound applied to the extracted detector transfer magnitude
+        before passing it to `sensitivity_function`. Defaults to 0.0, preserving
+        the physical detector transfer without regularization.
 
     Returns
     -------
@@ -311,6 +316,7 @@ def calculate_sensitivities(
     """
     noises: List[jnp.ndarray] = []
     powers: List[jnp.ndarray] = []
+    floor_value = float(max(transfer_floor, 0.0))
 
     for result in results:
         carrier_solution, signal_solution, noise, detector_indices = result[0], result[1], result[2], result[3]
@@ -327,6 +333,9 @@ def calculate_sensitivities(
         else:
             # Single-ended detection: use the first detector.
             signal_powers = jnp.abs(signal_powers[0])
+
+        if floor_value > 0:
+            signal_powers = jnp.maximum(signal_powers, floor_value)
 
         powers.append(signal_powers)
         noises.append(noise)
@@ -371,4 +380,3 @@ def sensitivity_qamplfreq_noise(
     amplitude_noise = powers[1] * 4e-9
     frequency_noise = (powers[2].T * frequencies).T * 1e-8
     return jnp.sqrt(q_noise**2 + amplitude_noise**2 + frequency_noise**2) / powers[0]
-
