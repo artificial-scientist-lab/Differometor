@@ -5,7 +5,7 @@ If you need to extend behavior, follow this order:
 1. Graph + placement:
    `_collect_nodes_to_skip` -> `_build_adjacency_and_attachments` ->
    `_place_connected_nodes` -> `_place_edge_attached_nodes` ->
-   `_reposition_detectors` -> `_orient_layout_detector_on_right`.
+   `_reposition_detectors` -> the selected layout-orientation policy.
 2. Beam metrics + scaling:
    `_prepare_beam_source_config` -> `_build_beam_records` ->
    `_global_max_series_by_source` -> `_add_beam_traces`.
@@ -43,6 +43,7 @@ _HIDDEN_COMPONENTS = {"free_mass", "frequency", "qhd", "signal"}
 _DETECTOR_LIKE_COMPONENTS = {"detector", "qnoised"}
 _POWER_CARRIER_COMPONENTS = {"mirror", "beamsplitter", "directional_beamsplitter"}
 _START_NODE_TYPES = {"laser", "squeezer", "detector", "qnoised"}
+_LAYOUT_ORIENTATIONS = {"detector_right", "native", "topology"}
 _DEFAULT_COLORS = {
     "beamsplitter": "#1f77b4",
     "directional_beamsplitter": "#ff7f0e",
@@ -586,7 +587,11 @@ def _rotate_layout_state(positions, left_dirs, visible_nodes, steps):
 
     for name, direction in list(left_dirs.items()):
         if direction in _CARDINAL_DIRECTIONS:
-            left_dirs[name] = _rotate_direction(direction, steps)
+            # `_CARDINAL_DIRECTIONS` is ordered clockwise, while
+            # `_rotate_quarter_turn(..., steps)` rotates coordinates
+            # counter-clockwise. Use the opposite sign so port metadata and
+            # component geometry receive the same physical rotation.
+            left_dirs[name] = _rotate_direction(direction, -steps)
 
 
 def _orient_layout_detector_on_right(positions, left_dirs, node_components, nodes_to_skip):
@@ -661,7 +666,88 @@ def _orient_layout_detector_on_right(positions, left_dirs, node_components, node
     _rotate_layout_state(positions, left_dirs, visible_nodes, best_steps)
 
 
-def _build_layout(setup, config):
+def _topology_grid_coordinate(node_name):
+    """Return the row/column encoded by a UIFO ``centerRC`` node name."""
+    prefix = "center"
+    if not str(node_name).startswith(prefix):
+        return None
+
+    coordinate = str(node_name)[len(prefix):]
+    if len(coordinate) != 2 or not coordinate.isdigit():
+        return None
+    return int(coordinate[0]), int(coordinate[1])
+
+
+def _orient_layout_like_topology_string(positions, left_dirs, nodes_to_skip):
+    """Orient a UIFO with row 1 at the top and column 1 at the left.
+
+    UIFO topology strings traverse ``center11``, ``center12``, ... in row-major
+    order. Graph placement preserves the grid but may choose any global
+    quarter-turn. Select the quarter-turn whose center positions best match
+    screen coordinates ``(column, -row)``.
+    """
+    grid_nodes = []
+    for node_name, position in positions.items():
+        if node_name in nodes_to_skip:
+            continue
+        coordinate = _topology_grid_coordinate(node_name)
+        if coordinate is None:
+            continue
+        row, column = coordinate
+        grid_nodes.append((node_name, row, column, np.asarray(position, dtype=float)))
+
+    rows = {row for _, row, _, _ in grid_nodes}
+    columns = {column for _, _, column, _ in grid_nodes}
+    if len(rows) < 2 or len(columns) < 2:
+        raise ValueError(
+            "layout_orientation='topology' requires a UIFO grid with at least "
+            "two rows and two columns of nodes named like 'center11'."
+        )
+
+    source_points = np.vstack([position for _, _, _, position in grid_nodes])
+    source_points -= np.mean(source_points, axis=0)
+    target_points = np.asarray(
+        [[float(column), -float(row)] for _, row, column, _ in grid_nodes],
+        dtype=float,
+    )
+    target_points -= np.mean(target_points, axis=0)
+
+    normalization = float(np.linalg.norm(source_points) * np.linalg.norm(target_points))
+    if normalization == 0:
+        raise ValueError("Cannot infer the UIFO topology orientation from coincident grid centers.")
+
+    scores = []
+    for steps in range(4):
+        rotated = np.vstack([_rotate_quarter_turn(point, steps) for point in source_points])
+        scores.append(float(np.sum(rotated * target_points) / normalization))
+
+    visible_nodes = [node for node in positions if node not in nodes_to_skip]
+    _rotate_layout_state(positions, left_dirs, visible_nodes, int(np.argmax(scores)))
+
+
+def _apply_layout_orientation(
+    positions,
+    left_dirs,
+    node_components,
+    nodes_to_skip,
+    layout_orientation,
+):
+    if layout_orientation not in _LAYOUT_ORIENTATIONS:
+        choices = ", ".join(sorted(_LAYOUT_ORIENTATIONS))
+        raise ValueError(f"layout_orientation must be one of: {choices}.")
+
+    if layout_orientation == "detector_right":
+        _orient_layout_detector_on_right(
+            positions,
+            left_dirs,
+            node_components,
+            nodes_to_skip,
+        )
+    elif layout_orientation == "topology":
+        _orient_layout_like_topology_string(positions, left_dirs, nodes_to_skip)
+
+
+def _build_layout(setup, config, layout_orientation="detector_right"):
     """Run the complete placement pipeline and return a render-ready layout."""
 
     node_components = {name: data.get("component", "") for name, data in setup.nodes(data=True)}
@@ -698,11 +784,12 @@ def _build_layout(setup, config):
         nodes_to_skip,
         config.attachment_length,
     )
-    _orient_layout_detector_on_right(
+    _apply_layout_orientation(
         positions,
         left_dirs,
         node_components,
         nodes_to_skip,
+        layout_orientation,
     )
     return _LayoutState(
         node_components=node_components,
@@ -1495,6 +1582,7 @@ def visualize_setup(
     min_space=1.0,
     length_scale=0.001,
     attachment_length=None,
+    layout_orientation="detector_right",
     port_to_index=None,
     powers=None,
     signals=None,
@@ -1514,6 +1602,13 @@ def visualize_setup(
 
     `output_file` is the output HTML filepath.
     `seed` is retained for API compatibility; layout placement is deterministic.
+
+    `layout_orientation` controls the final global quarter-turn:
+    - `"detector_right"` preserves the default behavior of placing the primary
+      detector on the right.
+    - `"native"` disables automatic rotation after graph placement.
+    - `"topology"` displays UIFO grids like their topology strings: row 1 at
+      the top, column 1 at the left, and row-major traversal left-to-right.
     """
     del show_labels, dpi, seed  # Retained for API compatibility.
     out_path = _resolve_html_output_path(output_file)
@@ -1525,7 +1620,7 @@ def visualize_setup(
         length_scale=length_scale,
         attachment_length=attachment_length,
     )
-    layout = _build_layout(setup, layout_config)
+    layout = _build_layout(setup, layout_config, layout_orientation=layout_orientation)
 
     if not layout.positions:
         return _render_empty_setup(out_path)

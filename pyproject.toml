@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "differometor"
-version = "0.0.5"
+version = "0.0.6"
 authors = [{ name="Artificial Scientist Lab", email="jonathan.klimesch@uni-tuebingen.de" }]
 description = "A Differentiable Interferometer Simulator for the Compuational Design of Gravitational Wave Detectors"
 readme = "README.md"
